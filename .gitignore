@@ -1,0 +1,12 @@
+node_modules/
+.zalo-creds.json
+.bridge-store.json
+.bridge-store.json.bak
+.bridge-store.json.tmp
+zalo-qr.png
+.env
+*.log
+.serve.pid
+inbox/
+tr-comments.cjs
+vn-comments.txt

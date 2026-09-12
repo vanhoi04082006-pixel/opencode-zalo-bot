@@ -1,0 +1,17 @@
+{
+  "name": "zalo-opencode-bridge",
+  "version": "0.1.0",
+  "description": "Control opencode via Zalo - solo group, AI: prefix",
+  "type": "module",
+  "scripts": {
+    "bridge": "node src/bridge.js",
+    "find-group": "node src/find-group.js",
+    "serve": "opencode serve --port 4096 --hostname 127.0.0.1"
+  },
+  "dependencies": {
+    "@opencode-ai/sdk": "^1.18.29",
+    "dotenv": "^16.4.5",
+    "sharp": "^0.35.4",
+    "zca-js": "^2.1.2"
+  }
+}
