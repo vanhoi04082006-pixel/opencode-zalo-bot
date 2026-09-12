@@ -26,7 +26,7 @@ npm run find-group   # scan QR in zalo-qr.png, copy groupId into .env (ZALO_GROU
 opencode serve --port 4096 --hostname 127.0.0.1
 npm run bridge       # first run scans QR, later runs log in with saved creds
 ```
-Done when the group shows `AI: bridge ready...`. Recommended: open `ZaloBridge-Panel.ps1` (double-click) to Start/Stop serve + bridge hidden.
+Done when the group shows `AI: bridge ready...`. Start/Stop serve + bridge via commands (`npm run bridge`, taskkill) or chat.
 
 ### Commands (see `/help` in chat)
 `/status /new /abort /sessions /projects /dir /ls /file /shot /model /variant /agent /rename /compact /commands /skills /mcps /messages /revert /fork /undo /redo /queue /task /tasklist /taskdel /shutdown /reboot /cancel-shutdown /opencode_start /opencode_stop /opencode_restart /ok`

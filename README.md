@@ -26,7 +26,7 @@ npm run find-group   # quét QR trong zalo-qr.png, chép groupId vào .env (ZALO
 opencode serve --port 4096 --hostname 127.0.0.1
 npm run bridge       # lần đầu quét QR, các lần sau login bằng creds đã lưu
 ```
-Xong khi group hiện `AI: bridge ready...`. Khuyến nghị mở `ZaloBridge-Panel.ps1` (double-click) để Start/Stop ẩn serve + bridge.
+Xong khi group hiện `AI: bridge ready...`. Start/Stop serve + bridge bằng lệnh (`npm run bridge`, taskkill) hoặc nhắn qua chat.
 
 ### Lệnh (xem `/help` trong chat)
 `/status /new /abort /sessions /projects /dir /ls /file /shot /model /variant /agent /rename /compact /commands /skills /mcps /messages /revert /fork /undo /redo /queue /task /tasklist /taskdel /shutdown /reboot /cancel-shutdown /opencode_start /opencode_stop /opencode_restart /ok`

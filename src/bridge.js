@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { config } from "./config.js";
 import { loadStore, saveStore, alreadySeen, markSeen, isDelivered, markDelivered, rememberSession } from "./store.js";
-import { extractReplyText, dangerCheck } from "./text.js";
+import { dangerCheck } from "./text.js";
 import {
   resolveSafePath,
   isOutsideScope,
