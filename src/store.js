@@ -1,12 +1,22 @@
 import fs from "node:fs";
 import { config } from "./config.js";
 
-const DEFAULT = { sessions: {}, seen: [], pending: {}, dirs: {}, models: {}, variants: {}, agents: {}, sensitiveAlways: {}, known: {}, tasks: [], delivered: {} };
+const DEFAULT = { sessions: {}, seen: [], pending: {}, dirs: {}, models: {}, variants: {}, agents: {}, sensitiveAlways: {}, known: {}, tasks: [], delivered: {}, threadTypes: {}, projectGroups: {} };
 
 export function loadStore() {
-  const parsed = readStoreFile(config.storePath) ?? readStoreFile(config.storePath + ".bak");
+  let parsed = readStoreFile(config.storePath);
+  let src = "store";
+  if (!parsed) {
+    parsed = readStoreFile(config.storePath + ".bak");
+    src = "BAK-FALLBACK (may be stale!)";
+  }
   if (!parsed) return structuredClone(DEFAULT);
   const s = parsed;
+  if (src !== "store") console.log(`[store] WARNING: primary store unreadable, loaded ${src}.`);
+  console.log(
+    `[store] Loaded ${src}: ${Object.keys(s.sessions ?? {}).length} sessions, ` +
+      `${Object.keys(s.projectGroups ?? {}).length} projectGroups, ${(Array.isArray(s.tasks) ? s.tasks : []).length} tasks.`
+  );
   return {
     sessions: s.sessions ?? {},
     seen: Array.isArray(s.seen) ? s.seen : [],
@@ -19,6 +29,8 @@ export function loadStore() {
     known: s.known ?? {},
     tasks: Array.isArray(s.tasks) ? s.tasks : [],
     delivered: s.delivered ?? {},
+    threadTypes: s.threadTypes ?? {},
+    projectGroups: s.projectGroups ?? {},
   };
 }
 
@@ -43,6 +55,11 @@ export function saveStore(store) {
       known: store.known ?? {},
       tasks: Array.isArray(store.tasks) ? store.tasks.slice(0, 10) : [],
       delivered: trimDelivered(store.delivered ?? {}),
+      // ThreadType per thread (Group vs DM) - survives restarts so scheduled
+      // tasks / background notifies to DMs don't fail with invalid-param.
+      threadTypes: store.threadTypes ?? {},
+      // Project -> auto-created group mapping (DM dispatcher): dirKey -> {groupId, name, purpose, createdAt, lastUsed}
+      projectGroups: store.projectGroups ?? {},
   };
   // Atomic write (tmp + rename) + .bak of the previous good file:
   // a crash mid-write can never leave a truncated store behind.

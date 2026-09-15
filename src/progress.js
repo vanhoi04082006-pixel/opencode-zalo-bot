@@ -8,8 +8,16 @@ function fmtDur(ms) {
   return `${Math.floor(s / 60)}p${String(s % 60).padStart(2, "0")}s`;
 }
 
-export function createProgress({ sendBubble, deleteBubble, sendTyping, getTodos, maxChars = 1500 }) {
+export function createProgress({ sendBubble, deleteBubble, sendTyping, getTodos, getIsDual, maxChars = 1500 }) {
   const states = {}; // key -> {threadId, title, tool, todos, startedAt, bubble, updates, timer, todoTimer, stopped}
+  const _getIsDual = getIsDual ?? (() => false);
+  const isDual = () => {
+    try {
+      return !!_getIsDual();
+    } catch {
+      return false;
+    }
+  };
 
   function compose(st) {
     const lines = [`⏳ Working (${fmtDur(Date.now() - st.startedAt)})${st.title ? `: ${st.title}` : ""}`];
@@ -58,17 +66,30 @@ export function createProgress({ sendBubble, deleteBubble, sendTyping, getTodos,
         stopped: false,
       };
       ensureTimer(key);
-      // Show "typing..." continuously while the run is busy
+      // Show "typing..." continuously while the run is busy (3s cadence:
+      // Zalo clients stop rendering after ~5s without refresh).
       if (sendTyping) {
         const tick = () => {
           const st = states[key];
           if (!st || st.stopped) return;
-          sendTyping(st.threadId).catch(() => {});
+          try {
+            sendTyping(st.threadId)?.catch?.((e) =>
+              console.log(`[typing] fail ${String(st.threadId).slice(-6)}: ${e?.message ?? e}`)
+            );
+          } catch (e) {
+            console.log(`[typing] fail ${String(st.threadId).slice(-6)}: ${e?.message ?? e}`);
+          }
         };
         tick();
-        states[key].typingTimer = setInterval(tick, 8000);
+        states[key].typingTimer = setInterval(tick, 3000);
         if (states[key].typingTimer.unref) states[key].typingTimer.unref();
       }
+      // Immediate Working bubble on every run start (1-2s feedback).
+      // Single: self-typing never renders, so bubble is the only signal.
+      // Dual groups: server doesn't broadcast API typing in groups, so bubble
+      // is the reliable signal (kept forever, terminal-style history).
+      // Dual DM: typing also shows, bubble is harmless duplication.
+      refresh(key).catch(() => {});
     },
     setTool(key, toolText) {
       const st = states[key];

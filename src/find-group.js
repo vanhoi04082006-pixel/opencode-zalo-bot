@@ -1,8 +1,13 @@
+import { config } from "./config.js";
 import { loginZalo } from "./zalo-login.js";
 
+const useBot = process.argv.includes("--bot");
 // List groups to get GROUP_ID for .env
 // getAllGroups() only returns { gridVerMap: { groupId: version } } -> id is in the KEY
-const api = await loginZalo();
+const api = useBot
+  ? await loginZalo({ credsPath: config.botCredsPath, qrPath: config.botQrPath, label: "zalo-bot" })
+  : await loginZalo();
+console.log(useBot ? "=== BOT MODE: groups/DMs the bot account sees ===" : "=== GROUPS - copy id into ZALO_GROUP_ID ===");
 const groups = await api.getAllGroups();
 const ids = Object.keys(groups?.gridVerMap ?? {});
 console.log(`=== GROUPS (${ids.length}) - copy id into ZALO_GROUP_ID ===`);

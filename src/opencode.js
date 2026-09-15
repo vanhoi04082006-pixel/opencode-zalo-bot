@@ -240,6 +240,88 @@ export async function pollSessionState(client, sessionID, directory, maxMs = 500
   return "busy";
 }
 
+// VCS branch for status header (null when not a git repo / lookup fails).
+export async function vcsBranch(client, directory) {
+  try {
+    const { data, error } = await client.vcs.get({ directory });
+    if (error || !data) return null;
+    return data.branch ?? data.default_branch ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// Context usage + cost for a session. Prefers session aggregates,
+// falls back to summing assistant messages (limit 200).
+// used = input+output+reasoning+cache (all occupy context window).
+export async function sessionUsage(client, sessionID, directory) {
+  const sum = (t) => (t?.input ?? 0) + (t?.output ?? 0) + (t?.reasoning ?? 0) + (t?.cache?.read ?? 0) + (t?.cache?.write ?? 0);
+  try {
+    const s = await getSession(client, sessionID, directory);
+    if (s?.tokens) return { used: sum(s.tokens), cost: s.cost ?? 0, model: s.model ?? null };
+    if (s && typeof s.cost === "number") return { used: 0, cost: s.cost, model: s.model ?? null };
+  } catch {}
+  try {
+    const msgs = await listMessages(client, sessionID, directory, 200);
+    let used = 0;
+    let cost = 0;
+    let model = null;
+    for (const m of msgs) {
+      const info = m?.info;
+      if (info?.role !== "assistant") continue;
+      if (info?.tokens) used += sum(info.tokens);
+      if (typeof info?.cost === "number") cost += info.cost;
+      if (!model && info?.modelID) model = { id: info.modelID, providerID: info.providerID ?? null, variant: info.variant ?? null };
+    }
+    return { used, cost, model };
+  } catch {}
+  return { used: 0, cost: 0, model: null };
+}
+
+// Model context window (denominator). Cached 10 min. Null when unresolvable
+// (server-default model) - caller should then hide "/ total (%)".
+let _limitCache = { at: 0, map: {} };
+export async function getModelLimit(client, providerID, modelID) {
+  if (!providerID || !modelID) return null;
+  const key = `${providerID}/${modelID}`;
+  try {
+    if (Date.now() - _limitCache.at < 600000 && _limitCache.map[key] !== undefined) return _limitCache.map[key];
+    const { data, error } = await client.config.providers();
+    const map = {};
+    if (!error) {
+      for (const p of data?.providers ?? []) {
+        for (const [mid, m] of Object.entries(p.models ?? {})) {
+          map[`${p.id}/${m?.id ?? mid}`] = m?.limit?.context ?? null;
+        }
+      }
+    }
+    _limitCache = { at: Date.now(), map };
+    return map[key] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// Files changed by the session (for status header). Prefers session diff
+// (what the session caused), falls back to VCS status (names only).
+export async function sessionFiles(client, sessionID, directory) {
+  const norm = (d) => ({
+    file: d?.file ?? d?.path ?? "?",
+    additions: d?.additions ?? 0,
+    deletions: d?.deletions ?? 0,
+    status: d?.status ?? null,
+  });
+  try {
+    const { data, error } = await client.session.diff({ sessionID, directory });
+    if (!error && Array.isArray(data) && data.length) return data.map(norm);
+  } catch {}
+  try {
+    const { data, error } = await client.vcs.status({ directory });
+    if (!error && Array.isArray(data) && data.length) return data.map(norm);
+  } catch {}
+  return [];
+}
+
 export async function listMessages(client, sessionID, directory, limit = 6) {
   const { data, error } = await client.session.messages({ sessionID, directory, limit });
   if (error) throw new Error(error?.message ?? "cannot read messages");
@@ -258,7 +340,7 @@ export async function getTodos(client, sessionID, directory) {
 
 export async function replyPermission(client, { requestID, directory, reply }) {
   const { error } = await client.permission.reply({ requestID, directory, reply });
-  if (error) throw new Error(error?.message ?? "permission reply failed");
+  if (error) throw new Error(sdkErrorMessage(error, "permission reply failed"));
 }
 
 export async function listPermissions(client, directory) {
@@ -273,7 +355,7 @@ export async function listPermissions(client, directory) {
 
 export async function replyQuestion(client, { requestID, directory, answers }) {
   const { error } = await client.question.reply({ requestID, directory, answers });
-  if (error) throw new Error(error?.message ?? "question reply failed");
+  if (error) throw new Error(sdkErrorMessage(error, "question reply failed"));
 }
 
 // SSE: prefer global stream (has directory, unfiltered), legacy per-dir fallback

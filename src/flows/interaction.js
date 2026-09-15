@@ -8,10 +8,12 @@ import {
   replyQuestion,
   groupDir,
 } from "../opencode.js";
-import { queues } from "../app/run-state.js";
+import { config, isDualAccount, isOwner } from "../config.js";
+import { queues, getThreadOwner } from "../app/run-state.js";
 import { sendAI, sendFiles, fileLabel } from "../zalo/send.js";
 import { runPrompt } from "./prompt.js";
 import { detectYesNo } from "../intent.js";
+import { aliveDir } from "../files.js";
 import { norm } from "../filefind.js";
 
 // bridge.js injects live singletons + domain actions once.
@@ -46,7 +48,7 @@ export async function doPowerAction(tid, action, seconds) {
 export function askPowerConfirm(tid, action, seconds) {
   const store = getStore();
   const what = action === "reboot" ? "REBOOT" : "SHUTDOWN";
-  store.pending[tid] = { kind: "confirm-shutdown", action, seconds, ts: Date.now() };
+  store.pending[tid] = { kind: "confirm-shutdown", action, seconds, ts: Date.now(), by: getThreadOwner(tid) };
   saveStore(store);
   return sendAI(tid, `Are you sure you want ${what} in ${seconds}s? Reply yes to proceed, no to cancel. (Expires in 2 min)`);
 }
@@ -61,14 +63,57 @@ function parseOnceAlwaysDeny(t) {
   return rep;
 }
 
+// FIFO permission queue ops (pure over store, no I/O - unit-testable).
+// Supports both the new permQueue box and the legacy single perm slot.
+export function peekPermQueue(store, threadId) {
+  const box = store.pending?.[threadId];
+  const raw = box?.kind === "permQueue" ? (box.items ?? []) : box?.kind === "perm" ? [{ ...box }] : [];
+  const now = Date.now();
+  const fresh = raw.filter((it) => now - (it.ts ?? now) <= 300000);
+  if (fresh.length !== raw.length) {
+    if (box?.kind === "permQueue") {
+      box.items = fresh;
+      if (!fresh.length) delete store.pending[threadId];
+    } else if (!fresh.length) {
+      delete store.pending[threadId];
+    }
+  }
+  return fresh[0] ?? null;
+}
+// Remove one answered ask by requestID. Returns remaining count.
+export function shiftPermQueue(store, threadId, requestID) {
+  const box = store.pending?.[threadId];
+  if (box?.kind === "permQueue") {
+    box.items = (box.items ?? []).filter((it) => it.requestID !== requestID);
+    if (!box.items.length) delete store.pending[threadId];
+    return box.items?.length ?? 0;
+  }
+  if (box?.kind === "perm" && (!requestID || box.requestID === requestID)) {
+    delete store.pending[threadId];
+  }
+  return 0;
+}
+
 // Try to consume the message as a pending-interaction reply.
 // Returns true when handled (caller must return), false to continue routing.
 // / commands always bypass interaction pendings (only numbers/natural text consume);
 // /abort clears pendings in its own handler.
-export async function tryConsumePending(threadId, t, isCmd) {
+export async function tryConsumePending(threadId, t, isCmd, uid) {
   const store = getStore();
   const client = getClient();
   const act = actions();
+
+  // Anti-hijack: in dual mode a pending confirmation belongs to its creator.
+  // Anyone else's 1/2/3/yes is dropped silently (no fallthrough to prompt,
+  // no reply to avoid spam loops). Single mode keeps legacy behavior.
+  // Legacy pendings without `by` (created before upgrade) stay consumable.
+  if (isDualAccount()) {
+    const p = store.pending[threadId];
+    if (p?.by && uid && String(p.by) !== String(uid)) {
+      console.log(`[bridge] Pending '${p.kind}' owned by ${String(p.by).slice(-4)}, ignored reply from ${String(uid).slice(-4)}`);
+      return true;
+    }
+  }
 
   // Natural confirmation for privileged commands (expires in 2 min)
   const conf = store.pending[threadId];
@@ -139,47 +184,51 @@ export async function tryConsumePending(threadId, t, isCmd) {
   }
 
 // Approve server permissions (highest priority - run is waiting; / bypasses)
-  const pm = store.pending[threadId];
-  if (!isCmd && pm?.kind === "perm") {
-    const rep = parseOnceAlwaysDeny(t);
-    if (!rep) {
-      await sendAI(threadId, "Reply: 1 = allow once, 2 = always, 3 = deny.");
-      return true;
-    }
-    try {
-      const replyDir = pm.sesDir ?? pm.directory;
-      await replyPermission(client, { requestID: pm.requestID, directory: replyDir, reply: rep });
-      delete store.pending[threadId];
-      saveStore(store);
-      await sendAI(threadId, `Sent: ${rep === "once" ? "allowed once" : rep === "always" ? "always" : "denied"}.`);
-    } catch (e) {
-      const msg = e?.message ?? String(e);
-      // Stale request (server replaced the id) -> find equivalent request and auto-reply
-      if (/not found/i.test(msg)) {
-        try {
-          const live = await listPermissions(client, pm.sesDir ?? pm.directory);
-          const equiv = live.find(
-            (r) =>
-              r.permission === pm.permission &&
-              (r.patterns ?? []).some((p) => (pm.patterns ?? []).includes(p))
-          );
-          if (equiv?.id) {
-            await replyPermission(client, { requestID: equiv.id, directory: pm.sesDir ?? pm.directory, reply: rep });
-            delete store.pending[threadId];
-            saveStore(store);
-            await sendAI(threadId, `Sent (new request): ${rep === "once" ? "allowed once" : rep === "always" ? "always" : "denied"}.`);
-            return true;
-          }
-        } catch {}
-        delete store.pending[threadId];
-        saveStore(store);
-        await sendAI(threadId, "Request expired (server replaced it or it passed). Ask the AI to redo that step.");
-        return true;
-      }
-      await sendAI(threadId, `Send failed, retry 1/2/3 (/abort to cancel).`);
-    }
+// FIFO: 1/2/3 answers the OLDEST unanswered ask; remaining count shown.
+const pmBox = store.pending[threadId];
+const pm = peekPermQueue(store, threadId);
+if (!isCmd && pm) {
+  const rep = parseOnceAlwaysDeny(t);
+  if (!rep) {
+    await sendAI(threadId, "Reply: 1 = allow once, 2 = always, 3 = deny.");
     return true;
   }
+  const leftNote = (n) => (n > 0 ? ` Còn ${n} quyền chờ: trả lời 1/2/3 tiếp.` : "");
+  const repLabel = rep === "once" ? "allowed once" : rep === "always" ? "always" : "denied";
+  try {
+    const replyDir = pm.sesDir ?? pm.directory;
+    await replyPermission(client, { requestID: pm.requestID, directory: replyDir, reply: rep });
+    const left = shiftPermQueue(store, threadId, pm.requestID);
+    saveStore(store);
+    await sendAI(threadId, `Sent: ${repLabel}.${leftNote(left)}`);
+  } catch (e) {
+    const msg = e?.message ?? String(e);
+    // Stale request (server replaced the id) -> find equivalent request and auto-reply
+    if (/not found/i.test(msg)) {
+      try {
+        const live = await listPermissions(client, pm.sesDir ?? pm.directory);
+        const equiv = live.find(
+          (r) =>
+            r.permission === pm.permission &&
+            (r.patterns ?? []).some((p) => (pm.patterns ?? []).includes(p))
+        );
+        if (equiv?.id) {
+          await replyPermission(client, { requestID: equiv.id, directory: pm.sesDir ?? pm.directory, reply: rep });
+          const left = shiftPermQueue(store, threadId, pm.requestID);
+          saveStore(store);
+          await sendAI(threadId, `Sent (new request): ${repLabel}.${leftNote(left)}`);
+          return true;
+        }
+      } catch {}
+      shiftPermQueue(store, threadId, pm.requestID);
+      saveStore(store);
+      await sendAI(threadId, "Request expired (server replaced it or it passed). Ask the AI to redo that step.");
+      return true;
+    }
+    await sendAI(threadId, `Send failed, retry 1/2/3 (/abort to cancel).`);
+  }
+  return true;
+}
 
   // Tra loi cau hoi tu server
   const qp = store.pending[threadId];
@@ -276,8 +325,27 @@ export async function tryConsumePending(threadId, t, isCmd) {
     return true;
   }
   const pick = store.pending[threadId];
+  // DM dispatcher: pick project dir to open a work group
+  if (!isCmd && pick?.kind === "pickwork" && /^\d{1,2}$/.test(t)) {
+    if (Date.now() - (pick.ts ?? 0) > 300000) {
+      delete store.pending[threadId];
+      saveStore(store);
+      await sendAI(threadId, "Selection expired. Send /work again.");
+      return true;
+    }
+    const dir = (pick.candidates ?? [])[Number(t) - 1];
+    if (!dir) {
+      await sendAI(threadId, `Pick a number 1-${(pick.candidates ?? []).length}.`);
+      return true;
+    }
+    const purpose = pick.purpose ?? dir;
+    delete store.pending[threadId];
+    saveStore(store);
+    await act.startWork(threadId, dir, purpose);
+    return true;
+  }
   // Cancel picking (pickproject/picksession/...): reply no/cancel
-  if (pick && ["pickproject", "picksession", "pickfile", "pickmodel", "pickvariant", "pickmessage", "pickcommand", "pickskill", "pickqueue"].includes(pick.kind) && detectYesNo(t) === "no") {
+  if (pick && ["pickproject", "picksession", "pickfile", "pickmodel", "pickvariant", "pickmessage", "pickcommand", "pickskill", "pickqueue", "pickwork"].includes(pick.kind) && detectYesNo(t) === "no") {
     delete store.pending[threadId];
     saveStore(store);
     await sendAI(threadId, "Selection cancelled.");
@@ -304,13 +372,17 @@ export async function tryConsumePending(threadId, t, isCmd) {
         store.sessions[threadId] = chosen;
         saveStore(store);
         let title = String(chosen).slice(-8);
+        let dirWarn = "";
         try {
           const info = await getSession(client, chosen, groupDir(store, threadId));
           title = info?.title ?? title;
+          if (info?.directory && !aliveDir(info.directory)) {
+            dirWarn = ` Warning: its folder no longer exists (${String(info.directory).slice(0, 80)}).`;
+          }
           rememberSession(store, chosen, info?.title, info?.directory);
           saveStore(store);
         } catch {}
-        await sendAI(threadId, `Switched to session '${title}'. Keep chatting to continue.`);
+        await sendAI(threadId, `Switched to session '${title}'.${dirWarn} Keep chatting to continue.`);
         return true;
       }
       if (pick.kind === "pickmodel") {
@@ -357,20 +429,39 @@ export async function handlePermAsked(threadId, dir, props, sid) {
   const client = getClient();
   const requestID = props?.id;
   if (!requestID) return;
-  const cur = store.pending[threadId];
-  if (cur?.kind === "perm" && cur.requestID === requestID) return;
+  // FIFO queue: rapid successive asks must ALL stay answerable (oldest first).
+  // Single-slot overwrite used to orphan earlier asks forever.
+  let box = store.pending[threadId];
+  if (!box || box.kind !== "permQueue") {
+    // Migrate legacy single perm slot (pre-upgrade) into the queue.
+    const items = [];
+    if (box?.kind === "perm" && box.requestID) {
+      items.push({
+        requestID: box.requestID,
+        directory: box.directory,
+        sesDir: box.sesDir,
+        permission: box.permission,
+        patterns: box.patterns ?? [],
+        ts: box.ts ?? Date.now(),
+      });
+    }
+    box = { kind: "permQueue", items, ts: Date.now(), by: getThreadOwner(threadId) };
+    store.pending[threadId] = box;
+  }
+  if (box.items.some((it) => it.requestID === requestID)) return; // dedup
   // Reply must use the SESSION directory (not the group dir) - else "not found"
   let sesDir = dir;
   try {
     const info = await getSession(client, sid, dir);
     if (info?.directory) sesDir = info.directory;
   } catch {}
-  store.pending[threadId] = { kind: "perm", requestID, directory: dir, sesDir, permission: props.permission, patterns: props.patterns ?? [], ts: Date.now() };
+  box.items.push({ requestID, directory: dir, sesDir, permission: props.permission, patterns: props.patterns ?? [], ts: Date.now() });
+  if (!box.by) box.by = getThreadOwner(threadId);
   saveStore(store);
   const what = [props.permission, ...((props.patterns ?? []).slice(0, 3))].filter(Boolean).join(" ").slice(0, 300);
   await sendAI(
     threadId,
-    `opencode requests permission: ${what || "?"}. Reply: 1 = allow once, 2 = always, 3 = deny.`
+    `opencode requests permission${box.items.length > 1 ? ` (${box.items.length} chờ)` : ""}: ${what || "?"}. Reply: 1 = allow once, 2 = always, 3 = deny.`
   );
 }
 
@@ -381,7 +472,7 @@ export async function handleQuestionAsked(threadId, dir, props) {
   if (!requestID || !questions.length) return;
   const cur = store.pending[threadId];
   if (cur?.kind === "qa" && cur.requestID === requestID) return;
-  store.pending[threadId] = { kind: "qa", requestID, directory: dir, questions, ts: Date.now() };
+  store.pending[threadId] = { kind: "qa", requestID, directory: dir, questions, ts: Date.now(), by: getThreadOwner(threadId) };
   saveStore(store);
   const blocks = questions.map((q, i) => {
     const opts = (q.options ?? []).map((o, j) => `${j + 1}. ${o.label}${o.description ? " - " + o.description : ""}`);

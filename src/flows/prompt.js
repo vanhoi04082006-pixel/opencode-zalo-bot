@@ -21,7 +21,7 @@ import {
   isOutsideScope,
   sensitivity,
 } from "../files.js";
-import { runs, queues, chainGroup, clearRunTimers } from "../app/run-state.js";
+import { runs, queues, chainGroup, clearRunTimers, getThreadOwner, isUnsent } from "../app/run-state.js";
 import { sendAI, sendFiles, fileLabel } from "../zalo/send.js";
 import { ZALO_SYSTEM, buildAnchor } from "./system-prompt.js";
 
@@ -91,7 +91,7 @@ export function gateSensitiveFile(threadId, absPaths) {
     }
   }
   if (!needAsk.length) return "ok";
-  store.pending[threadId] = { kind: "sensitive-file", paths: absPaths, ts: Date.now() };
+  store.pending[threadId] = { kind: "sensitive-file", paths: absPaths, ts: Date.now(), by: getThreadOwner(threadId) };
   saveStore(store);
   const names = needAsk.slice(0, 3).map((p) => fileLabel(p)).join(", ");
   sendAI(threadId, `Sensitive file(s) (${names}). Reply: 1 = allow once, 2 = always (this session), 3 = deny.`).catch(() => {});
@@ -99,7 +99,7 @@ export function gateSensitiveFile(threadId, absPaths) {
 }
 
 // Fire-and-forget prompt; results arrive via SSE (session.idle)
-export async function runPrompt(threadId, text, approved, fileParts = [], _retried = false, srcMsgId = null) {
+export async function runPrompt(threadId, text, approved, fileParts = [], _retried = false, srcMsgId = null, systemOverride = null) {
   const store = getStore();
   const client = getClient();
   const note = approved ? "[approved via /ok] " : "";
@@ -125,24 +125,24 @@ export async function runPrompt(threadId, text, approved, fileParts = [], _retri
         await sendAI(threadId, "Queue full (5). Wait for the current task, then resend.");
         return;
       }
-      q.push({ kind: "prompt", text: fullText, approved: false, fileParts: parts, srcMsgId });
+      q.push({ kind: "prompt", text: fullText, approved: false, fileParts: parts, srcMsgId, system: systemOverride });
       await sendAI(threadId, `Queued (${q.length}). Will run after the current task.`);
       return;
     }
-    await startRun(threadId, sid, fullText, parts, fresh, text, srcMsgId);
+    await startRun(threadId, sid, fullText, parts, fresh, text, srcMsgId, false, systemOverride);
   } catch (e) {
     const msg = e?.message ?? String(e);
     if (!_retried && /not found|session not found|404/i.test(msg)) {
       delete store.sessions[threadId];
       saveStore(store);
-      await runPrompt(threadId, text, approved, fileParts, true, srcMsgId);
+      await runPrompt(threadId, text, approved, fileParts, true, srcMsgId, systemOverride);
       return;
     }
     await sendAI(threadId, `opencode error: ${msg.slice(0, 500)}`);
   }
 }
 
-export async function startRun(threadId, sid, fullText, fileParts, fresh, firstText, srcMsgId = null, _retried = false) {
+export async function startRun(threadId, sid, fullText, fileParts, fresh, firstText, srcMsgId = null, _retried = false, system = null) {
   const store = getStore();
   const client = getClient();
   const prog = getProg();
@@ -163,7 +163,7 @@ export async function startRun(threadId, sid, fullText, fileParts, fresh, firstT
       ...(model ? { model } : {}),
       ...(variant ? { variant } : {}),
       ...(agent ? { agent } : {}),
-      system: ZALO_SYSTEM,
+      system: system ?? ZALO_SYSTEM,
       parts: [{ type: "text", text: anchor + fullText }, ...fileParts],
     });
   } catch (e) {
@@ -178,7 +178,7 @@ export async function startRun(threadId, sid, fullText, fileParts, fresh, firstT
         const freshSid = await getOrCreateSession(client, store, threadId);
         store.sessions[threadId] = freshSid;
         saveStore(store);
-        await startRun(threadId, freshSid, fullText, fileParts, true, firstText, srcMsgId, true);
+        await startRun(threadId, freshSid, fullText, fileParts, true, firstText, srcMsgId, true, system);
         return;
       } catch (e2) {
         await sendAI(threadId, `Prompt send error: ${(e2?.message ?? String(e2)).slice(0, 300)}`);
@@ -194,12 +194,15 @@ export async function startRun(threadId, sid, fullText, fileParts, fresh, firstT
 export function flushQueue(threadId) {
   const q = queues[threadId];
   if (!q?.length) return;
-  const next = q.shift();
+  // Drop items unsent while queued (tombstoned) - silently.
+  let next = q.shift();
+  while (next && isUnsent(next.srcMsgId)) next = q.shift();
+  if (!next) return;
   if (next.kind === "command") {
     chainGroup(threadId, () => fireCommand(threadId, next.command, next.args));
     return;
   }
-  chainGroup(threadId, () => runPrompt(threadId, next.text, false, next.fileParts, false, next.srcMsgId ?? null));
+  chainGroup(threadId, () => runPrompt(threadId, next.text, false, next.fileParts, false, next.srcMsgId ?? null, next.system ?? null));
 }
 
 // Run command/skill (results via SSE like prompts)
@@ -342,7 +345,7 @@ export async function autoAttachReply(threadId, reply) {
       const shots = sendable.filter(isScreenshotFile);
       if (shots.length) {
         const store = getStore();
-        store.pending[threadId] = { kind: "sensitive-file", paths: sendable, ts: Date.now() };
+        store.pending[threadId] = { kind: "sensitive-file", paths: sendable, ts: Date.now(), by: getThreadOwner(threadId) };
         saveStore(store);
         await sendAI(threadId, `Screenshot ready (${shots.map((p) => fileLabel(p)).join(", ")}). Reply: 1 = send, 2 = always this session, 3 = cancel.`);
         return;

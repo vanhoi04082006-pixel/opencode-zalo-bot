@@ -1,12 +1,13 @@
 import { ThreadType } from "zca-js";
 import fs from "node:fs";
 import path from "node:path";
-import { config } from "./config.js";
+import { config, isDualAccount, isThreadAllowed, isOwner } from "./config.js";
 import { loadStore, saveStore, alreadySeen, markSeen, isDelivered, markDelivered, rememberSession } from "./store.js";
 import { dangerCheck } from "./text.js";
 import {
   resolveSafePath,
   isOutsideScope,
+  aliveDir,
   sensitivity,
   checkSendable,
   mimeForAttach,
@@ -16,10 +17,10 @@ import {
   extractAttachment,
   INBOUND_LABEL,
 } from "./files.js";
-import { loginZalo, getCookieHeader } from "./zalo-login.js";
+import { loginZalo, loginBot, getCookieHeader } from "./zalo-login.js";
 import { createProgress } from "./progress.js";
-import { sentCli, srcIds, runs, queues, trackSrcId, chainGroup, clearRunTimers } from "./app/run-state.js";
-import { initSender, sleep, sendBubble, deleteBubble, sendAI, sendFiles, fileLabel } from "./zalo/send.js";
+import { sentCli, srcIds, runs, queues, trackSrcId, chainGroup, clearRunTimers, setThreadOwner, getThreadOwner, markUnsent, isUnsent } from "./app/run-state.js";
+import { initSender, sleep, sendBubble, deleteBubble, sendAI, sendFiles, fileLabel, setThreadType, getThreadType } from "./zalo/send.js";
 import {
   initPrompt,
   groupOfSession,
@@ -39,6 +40,8 @@ import {
   handleQuestionAsked,
 } from "./flows/interaction.js";
 import { detectShutdownIntent, detectDirIntent } from "./intent.js";
+import { buildStatusHeader } from "./flows/status.js";
+import { DISPATCHER_SYSTEM } from "./flows/system-prompt.js";
 import { execFile, spawn } from "node:child_process";
 import { listTopDirs, buildIndex, searchFiles, norm } from "./filefind.js";
 import { parseSchedule, describeTask, fmtTime } from "./tasks.js";
@@ -92,14 +95,42 @@ let api;
 let client;
 let stopSSE = null;
 let ownUid = null;
-initSender({ getApi: () => api, getOwnUid: () => ownUid });
+// Dual-account (dedicated bot): resolved in main() via auto-detect.
+// Single = legacy shared-account behavior (AI_PREFIX loop guard, solo group).
+let isDual = false;
+// Recent threads (dual bgNotify fallback when a session maps nowhere).
+const recentThreads = [];
+function touchRecent(threadId, threadType) {
+  const id = String(threadId);
+  const i = recentThreads.findIndex((t) => t.id === id);
+  if (i >= 0) recentThreads.splice(i, 1);
+  recentThreads.unshift({ id, type: threadType ?? ThreadType.Group });
+  if (recentThreads.length > 10) recentThreads.length = 10;
+}
+function notifyTarget() {
+  if (!isDual) return config.groupId;
+  // Dual: ZALO_GROUP_ID is the single-mode solo group (bot is NOT a member),
+  // so never use it here - sending there fails with "Tham so khong hop le".
+  if (config.allowedThreads.length) return config.allowedThreads[0];
+  return recentThreads[0]?.id ?? null;
+}
+initSender({ getApi: () => api, getOwnUid: () => ownUid, getIsDual: () => isDual, getStore: () => store });
 
 // Whole-drive file index (background build, refresh every 10 min)
 
 const prog = createProgress({
   sendBubble,
   deleteBubble,
-  sendTyping: (threadId) => api.sendTypingEvent(threadId, ThreadType.Group),
+  sendTyping: (threadId) => {
+    // Never throw sync (api may be null before login) - progress tick handles rejection.
+    try {
+      if (!api) return Promise.reject(new Error("api not ready"));
+      return api.sendTypingEvent(threadId, getThreadType(threadId));
+    } catch (e) {
+      return Promise.reject(e);
+    }
+  },
+  getIsDual: () => isDual,
 });
 initPrompt({ getClient: () => client, getStore: () => store, getProg: () => prog });
 initInteraction({
@@ -112,6 +143,7 @@ initInteraction({
     offerOneFile: (threadId, abs, knownBytes) => offerOneFile(threadId, abs, knownBytes),
     doSwitchDir: (threadId, raw) => doSwitchDir(threadId, raw),
     serveConfirm: (threadId, action) => serveConfirm(threadId, action),
+    startWork: (threadId, dir, purpose) => startWork(threadId, dir, purpose),
   },
 });
 
@@ -150,9 +182,22 @@ async function offerSearchResults(threadId, displayQuery, { scope, results }) {
     } catch {}
     return `${i + 1}. ${p.split(path.sep).pop()}${size}`;
   });
-  store.pending[threadId] = { kind: "pickfile", candidates: valid.slice(0, 8), ts: Date.now() };
+  store.pending[threadId] = { kind: "pickfile", candidates: valid.slice(0, 8), ts: Date.now(), by: getThreadOwner(threadId) };
   saveStore(store);
   await sendAI(threadId, `Found ${valid.length} files${hint}:\n${lines.join("\n")}\nReply a number (1-${Math.min(valid.length, 8)}) to send.`);
+}
+
+// Drop known-session cache rows pointing at deleted folders (they would
+// otherwise reappear in /projects and background notifications).
+function pruneDeadKnown() {
+  let pruned = false;
+  for (const [id, k] of Object.entries(store.known ?? {})) {
+    if (k?.dir && !aliveDir(k.dir)) {
+      delete store.known[id];
+      pruned = true;
+    }
+  }
+  if (pruned) saveStore(store);
 }
 
 // Switch working directory (shared by /dir and natural intent)
@@ -225,7 +270,7 @@ async function showLs(threadId, rawDir) {
     }
   }
   const items = [...dirs.sort((a, b) => a.name.localeCompare(b.name)), ...files.sort((a, b) => a.name.localeCompare(b.name))].slice(0, 20);
-  store.pending[threadId] = { kind: "pickls", cwd: abs, candidates: items, ts: Date.now() };
+  store.pending[threadId] = { kind: "pickls", cwd: abs, candidates: items, ts: Date.now(), by: getThreadOwner(threadId) };
   saveStore(store);
   const lines = items.map((e, i) => `${i + 1}. ${e.isDir ? "📁" : "📄"} ${e.name}`);
   await sendAI(
@@ -248,7 +293,7 @@ async function attachLsFile(threadId, absPath) {
     return;
   }
   if (level === "sensitive") {
-    store.pending[threadId] = { kind: "sensitive-attach", path: real, ts: Date.now() };
+    store.pending[threadId] = { kind: "sensitive-attach", path: real, ts: Date.now(), by: getThreadOwner(threadId) };
     saveStore(store);
     await sendAI(threadId, `Sensitive file '${fileLabel(real)}'. Reply: 1 = attach, 3 = cancel.`);
     return;
@@ -263,7 +308,7 @@ async function attachLsFile(threadId, absPath) {
 }
 
 function setLsAttach(threadId, absPath) {
-  store.pending[threadId] = { kind: "lsattach", path: absPath, ts: Date.now() };
+  store.pending[threadId] = { kind: "lsattach", path: absPath, ts: Date.now(), by: getThreadOwner(threadId) };
   saveStore(store);
 }
 
@@ -342,12 +387,14 @@ function startWatchdog(groupId) {
   const timer = setInterval(async () => {
     try {
       const up = await serveHealthy();
+      // Dual listen-all may have no target at boot; resolve fresh each tick.
+      const target = groupId ?? notifyTarget();
       if (!up && !serveWasDown) {
         serveWasDown = true;
-        await sendAI(groupId, "opencode serve is down. Restarting...").catch(() => {});
+        if (target) await sendAI(target, "opencode serve is down. Restarting...").catch(() => {});
         const ok = await ensureServe();
         serveWasDown = !ok;
-        await sendAI(groupId, ok ? "Serve is back." : "Auto-restart failed. Manually run: opencode serve --port 4096.").catch(() => {});
+        if (target) await sendAI(target, ok ? "Serve is back." : "Auto-restart failed. Manually run: opencode serve --port 4096.").catch(() => {});
       } else if (up && serveWasDown) {
         serveWasDown = false;
       }
@@ -356,7 +403,9 @@ function startWatchdog(groupId) {
   if (timer.unref) timer.unref();
 }
 
-async function handleGroupText(threadId, text, msgId) {
+async function handleGroupText(threadId, text, msgId, uid, cliMsgId) {
+  // Retracted before processing (unsend won the race) -> drop silently.
+  if (isUnsent(msgId) || isUnsent(cliMsgId)) return;
   let t = text.trim();
   if (!t) return;
 
@@ -366,36 +415,51 @@ async function handleGroupText(threadId, text, msgId) {
   const isCmd = t.startsWith("/") && KNOWN_COMMANDS.includes(cmdProbe);
 
   // Pending-interaction replies (confirm/perm/qa/pick/...) live in ./flows/interaction.js
-  if (await tryConsumePending(threadId, t, isCmd)) return;
+  if (await tryConsumePending(threadId, t, isCmd, uid)) return;
+
+  // Dual DM: dispatcher. Layer 1 = free smart templates; Layer 2 = AI
+  // dispatcher fallback (short natural chat). Real work stays in groups.
+  const isDM = isDual && getThreadType(threadId) === ThreadType.User;
+  const dmAllowed =
+    t === "/work" || t.startsWith("/work ") || t === "/groups" || t === "/help" || t === "/task" || t.startsWith("/task ") || t === "/tasklist" || t.startsWith("/taskdel");
+  if (isDM && !dmAllowed) {
+    if (await handleDMsoft(threadId, t)) return;
+    await runPrompt(threadId, t, false, [], false, msgId !== undefined ? String(msgId) : null, DISPATCHER_SYSTEM);
+    return;
+  }
 
   // Chap nhan //status -> /status (de phong go thua dau /)
   const normCmd = t.replace(/^\/+/, "/");
   const cmdName = normCmd.split(/\s+/)[0];
-  if (["/help", "/status", "/new", "/abort", "/ok", "/dir", "/projects", "/sessions", "/model", "/variant", "/agent", "/rename", "/compact", "/commands", "/skills", "/mcps", "/messages", "/revert", "/fork", "/undo", "/redo", "/ls", "/queue", "/file", "/shot", "/task", "/tasklist", "/taskdel", "/opencode_start", "/opencode_stop", "/opencode_restart", "/shutdown", "/reboot", "/cancel-shutdown"].includes(cmdName)) t = normCmd;
+  if (["/help", "/status", "/new", "/abort", "/ok", "/dir", "/projects", "/sessions", "/model", "/variant", "/agent", "/rename", "/compact", "/commands", "/skills", "/mcps", "/messages", "/revert", "/fork", "/undo", "/redo", "/ls", "/queue", "/file", "/shot", "/task", "/tasklist", "/taskdel", "/opencode_start", "/opencode_stop", "/opencode_restart", "/shutdown", "/reboot", "/cancel-shutdown", "/work", "/groups"].includes(cmdName)) t = normCmd;
 
   if (t === "/help") {
+    if (isDM) {
+      await sendAI(
+        threadId,
+        "DM điều phối:\n/work <path> - Mở/tiếp tục nhóm project (vd /work E:\\Projects\\X)\n/groups - Nhóm project đang quản lý\n/help - Trợ giúp\nChat việc trong nhóm project nhé."
+      );
+      return;
+    }
     await sendAI(
       threadId,
-      "Commands:\n\n/status - Server and session status\n/new [name] - Create a new session\n/abort - Stop the current task\n/sessions - List/switch sessions\n/projects - List/switch projects\n/dir [folder] - Show/change directory\n/ls [folder] - Browse files + attach\nsend <file> - Send a file naturally\n/file <name> - Send a file for sure\n/shot [url] - Capture screen (asks before sending)\n/model [name] - Show/change model\n/variant [name] - Show/change variant\n/agent [name] - Switch build/plan agent\n/rename <name> - Rename session\n/compact - Compact context\n/commands - Custom commands\n/skills - Skills catalog\n/mcps - MCP servers\n/messages - Browse + revert/fork\n/undo - Step back\n/redo - Step forward\n/queue - View/remove queued items\n/task <schedule> | <job> - Schedule\n/tasklist - List/delete tasks\n/shutdown [sec] - Schedule shutdown\n/reboot [sec] - Schedule reboot\n/cancel-shutdown - Cancel power action\n/opencode_start - Start server\n/opencode_stop - Stop server\n/opencode_restart - Restart server\n/ok - Approve pending"
+      "Commands:\n\n/status - Server and session status\n/new [name] - Create a new session\n/abort - Stop the current task\n/sessions - List/switch sessions\n/projects - List/switch projects\n/dir [folder] - Show/change directory\n/ls [folder] - Browse files + attach\nsend <file> - Send a file naturally\n/file <name> - Send a file for sure\n/shot [url] - Capture screen (asks before sending)\n/model [name] - Show/change model\n/variant [name] - Show/change variant\n/agent [name] - Switch build/plan agent\n/rename <name> - Rename session\n/compact - Compact context\n/commands - Custom commands\n/skills - Skills catalog\n/mcps - MCP servers\n/messages - Browse + revert/fork\n/undo - Step back\n/redo - Step forward\n/queue - View/remove queued items\n/task <schedule> | <job> - Schedule\n/tasklist - List/delete tasks\n/groups - Managed project groups\n(DM bot: /work <path> - Open project group)\n/shutdown [sec] - Schedule shutdown\n/reboot [sec] - Schedule reboot\n/cancel-shutdown - Cancel power action\n/opencode_start - Start server\n/opencode_stop - Stop server\n/opencode_restart - Restart server\n/ok - Approve pending"
     );
     return;
   }
   if (t === "/status") {
     const sid = store.sessions[threadId];
+    if (sid) {
+      const header = await buildStatusHeader(client, store, threadId, { purpose: purposeOfThread(threadId) });
+      await sendAI(threadId, header);
+      return;
+    }
     const m = store.models?.[threadId];
     const v = store.variants?.[threadId];
     const ag = store.agents?.[threadId];
-    let title = "(none)";
-    if (sid) {
-      try {
-        title = (await getSession(client, sid, groupDir(store, threadId)))?.title ?? String(sid).slice(-8);
-      } catch {
-        title = String(sid).slice(-8);
-      }
-    }
     await sendAI(
       threadId,
-      `OK. session=${title} dir=${groupDir(store, threadId)} model=${m ? m.providerID + "/" + m.modelID : "(default)"}${v ? ` variant=${v}` : ""}${ag ? ` agent=${ag}` : ""}`
+      `OK. session=(none) dir=${groupDir(store, threadId)} model=${m ? m.providerID + "/" + m.modelID : "(default)"}${v ? ` variant=${v}` : ""}${ag ? ` agent=${ag}` : ""}`
     );
     return;
   }
@@ -459,6 +523,11 @@ async function handleGroupText(threadId, text, msgId) {
       await sendAI(threadId, "Nothing pending approval.");
       return;
     }
+    // Dual: only the pending creator may approve (anti-hijack, same rule as tryConsumePending).
+    if (isDual && p.by && uid && String(p.by) !== String(uid)) {
+      console.log(`[bridge] /ok denied (owner ${String(p.by).slice(-4)} vs ${String(uid).slice(-4)})`);
+      return;
+    }
     delete store.pending[threadId];
     saveStore(store);
     if (p.kind === "sendfile") {
@@ -496,7 +565,7 @@ async function handleGroupText(threadId, text, msgId) {
   }
   if (t === "/opencode_stop" || t === "/opencode_restart") {
     const action = t === "/opencode_stop" ? "stop" : "restart";
-    store.pending[threadId] = { kind: "confirm-serve", action, ts: Date.now() };
+    store.pending[threadId] = { kind: "confirm-serve", action, ts: Date.now(), by: getThreadOwner(threadId) };
     saveStore(store);
     await sendAI(threadId, `Stop opencode serve? Running sessions will halt. Reply yes to ${action}, no to cancel. (Expires in 2 min)`);
     return;
@@ -537,9 +606,10 @@ async function handleGroupText(threadId, text, msgId) {
       const when = d ? `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")} ${d.getDate()}/${d.getMonth() + 1}` : "?";
       const mark = s.id === cur ? " *" : "";
       const dirShort = s?.directory ? String(s.directory).split(path.sep).filter(Boolean).pop() : "";
-      return `${i + 1}. ${(s.title ?? "(no title)").slice(0, 34)}${dirShort ? ` [${dirShort}]` : ""} [${when}]${mark}`;
+      const gone = s?.directory && !aliveDir(s.directory) ? " 🗑(folder gone)" : "";
+      return `${i + 1}. ${(s.title ?? "(no title)").slice(0, 34)}${dirShort ? ` [${dirShort}]` : ""} [${when}]${mark}${gone}`;
     });
-    store.pending[threadId] = { kind: "picksession", candidates: items.map((s) => s.id), ts: Date.now() };
+    store.pending[threadId] = { kind: "picksession", candidates: items.map((s) => s.id), ts: Date.now(), by: getThreadOwner(threadId) };
     saveStore(store);
     await sendAI(threadId, `Recent sessions (* = current):\n${lines.join("\n")}\nReply a number to switch.`);
     return;
@@ -572,10 +642,13 @@ async function handleGroupText(threadId, text, msgId) {
       }
       for (const [d, u] of Object.entries(byDir)) addWorktree(d, u);
     } catch {}
+    pruneDeadKnown();
     for (const k of Object.values(store.known ?? {})) {
       if (k?.dir) addWorktree(k.dir, k.lastSeen ?? 0);
     }
     addWorktree(config.workdir, 0); // E:\ root always present, ranked last unless current
+    // An folder ma: serve/session/known giu lai dir da xoa -> chi hien dir con ton tai
+    projects = projects.filter((p) => aliveDir(p.worktree));
     const curDir = groupDir(store, threadId);
     projects.sort((a, b) => {
       const ac = String(a.worktree ?? "").toLowerCase() === curDir.toLowerCase() ? 1 : 0;
@@ -593,7 +666,7 @@ async function handleGroupText(threadId, text, msgId) {
       const mark = p.worktree.toLowerCase() === cur ? " *" : "";
       return `${i + 1}. ${p.name.slice(0, 40)} [${p.worktree.slice(0, 50)}]${mark}`;
     });
-    store.pending[threadId] = { kind: "pickproject", candidates: items.map((p) => p.worktree), ts: Date.now() };
+    store.pending[threadId] = { kind: "pickproject", candidates: items.map((p) => p.worktree), ts: Date.now(), by: getThreadOwner(threadId) };
     saveStore(store);
     await sendAI(threadId, `At: ${curDir}\nProjects (* = current):\n${lines.join("\n")}\nReply a number to switch (new session) | no = cancel.`);
     return;
@@ -637,6 +710,7 @@ async function handleGroupText(threadId, text, msgId) {
       kind: "pickmodel",
       candidates: match.slice(0, 8).map((m) => ({ providerID: m.providerID, modelID: m.modelID })),
       ts: Date.now(),
+      by: getThreadOwner(threadId),
     };
     saveStore(store);
     await sendAI(threadId, `Multiple models match:\n${lines.join("\n")}\nReply a number.`);
@@ -696,6 +770,7 @@ async function handleGroupText(threadId, text, msgId) {
       kind: "pickvariant",
       candidates: hits.slice(0, 8).map((h) => ({ providerID: h.providerID, modelID: h.modelID, variant: h.variant })),
       ts: Date.now(),
+      by: getThreadOwner(threadId),
     };
     saveStore(store);
     await sendAI(threadId, `Multiple variants match:\n${lines.join("\n")}\nReply a number.`);
@@ -754,7 +829,7 @@ async function handleGroupText(threadId, text, msgId) {
     if (!m) {
       try {
         const s = await getSession(client, sid, dir);
-        if (s?.modelID) m = { providerID: s.providerID ?? "opencode", modelID: s.modelID };
+        if (s?.model?.id) m = { providerID: s.model.providerID ?? "opencode", modelID: s.model.id };
       } catch {}
     }
     if (!m) {
@@ -800,7 +875,7 @@ async function handleGroupText(threadId, text, msgId) {
       return;
     }
     const items = catalog.commands.slice(0, 10);
-    store.pending[threadId] = { kind: "pickcommand", candidates: items.map((c) => c.name), ts: Date.now() };
+    store.pending[threadId] = { kind: "pickcommand", candidates: items.map((c) => c.name), ts: Date.now(), by: getThreadOwner(threadId) };
     saveStore(store);
     await sendAI(threadId, `Commands:\n${items.map((c, i) => `${i + 1}. ${c.name}${c.description ? " - " + c.description.slice(0, 60) : ""}`).join("\n")}\nNhan so de chay (vd: /commands 1).`);
     return;
@@ -836,7 +911,7 @@ async function handleGroupText(threadId, text, msgId) {
       return;
     }
     const items = catalog.skills.slice(0, 12);
-    store.pending[threadId] = { kind: "pickskill", candidates: items.map((c) => c.name), ts: Date.now() };
+    store.pending[threadId] = { kind: "pickskill", candidates: items.map((c) => c.name), ts: Date.now(), by: getThreadOwner(threadId) };
     saveStore(store);
     await sendAI(threadId, `Skills:\n${items.map((c, i) => `${i + 1}. ${c.name}${c.description ? " - " + c.description.slice(0, 60) : ""}`).join("\n")}\nNhan so de chay (vd: /skills 2).`);
     return;
@@ -874,7 +949,7 @@ async function handleGroupText(threadId, text, msgId) {
       await sendAI(threadId, "Session has no user messages yet.");
       return;
     }
-    store.pending[threadId] = { kind: "pickmessage", candidates: items.map((m) => m.id), ts: Date.now() };
+    store.pending[threadId] = { kind: "pickmessage", candidates: items.map((m) => m.id), ts: Date.now(), by: getThreadOwner(threadId) };
     saveStore(store);
     await sendAI(
       threadId,
@@ -1011,7 +1086,7 @@ async function handleGroupText(threadId, text, msgId) {
       await sendAI(threadId, runs[sid]?.busy ? "Working on 1 task, queue empty." : "Nothing running, queue empty.");
       return;
     }
-    store.pending[threadId] = { kind: "pickqueue", candidates: q.map((_, i) => i), ts: Date.now() };
+    store.pending[threadId] = { kind: "pickqueue", candidates: q.map((_, i) => i), ts: Date.now(), by: getThreadOwner(threadId) };
     saveStore(store);
     await sendAI(
       threadId,
@@ -1021,7 +1096,9 @@ async function handleGroupText(threadId, text, msgId) {
   }
 
   if (t === "/tasklist") {
-    const items = getTasks();
+    // Dual: only this thread's tasks (no cross-thread enum/delete).
+    // Single: one thread anyway, behavior unchanged.
+    const items = isDual ? getTasks().filter((x) => String(x.groupId) === String(threadId)) : getTasks();
     if (!items.length) {
       await sendAI(threadId, "No scheduled tasks. Create: /task <schedule> | <job> (ex /task in 30m | drink water reminder).");
       return;
@@ -1035,7 +1112,8 @@ async function handleGroupText(threadId, text, msgId) {
 
   const taskdel = t.match(/^\/taskdel\s+(\d{1,2})$/);
   if (taskdel) {
-    const item = getTasks()[Number(taskdel[1]) - 1];
+    const items = isDual ? getTasks().filter((x) => String(x.groupId) === String(threadId)) : getTasks();
+    const item = items[Number(taskdel[1]) - 1];
     if (!item) {
       await sendAI(threadId, "Invalid number. Send /tasklist.");
       return;
@@ -1092,6 +1170,28 @@ async function handleGroupText(threadId, text, msgId) {
       return;
     }
     await sendAI(threadId, `Scheduled: ${describeTask(again ?? task)}. PC off = tasks don't run.`);
+    return;
+  }
+
+  if (t === "/work" || t.startsWith("/work ")) {
+    if (!isDual || !isDM) {
+      await sendAI(threadId, "Lệnh này dùng khi nhắn riêng cho bot (dual).");
+      return;
+    }
+    const raw = t
+      .replace(/^\/work\s*/, "")
+      .replace(/^["']|["']$/g, "")
+      .trim();
+    if (!raw) {
+      await sendAI(threadId, "Usage: /work <đường dẫn project> (vd /work E:\\Projects\\X). Xem nhóm đang có: /groups.");
+      return;
+    }
+    await doWorkCommand(threadId, raw);
+    return;
+  }
+
+  if (t === "/groups") {
+    await doGroupsCommand(threadId);
     return;
   }
 
@@ -1159,7 +1259,7 @@ async function handleGroupText(threadId, text, msgId) {
       return;
     }
     const real = chk.path ?? shotPath;
-    store.pending[threadId] = { kind: "sensitive-file", paths: [real], ts: Date.now() };
+    store.pending[threadId] = { kind: "sensitive-file", paths: [real], ts: Date.now(), by: getThreadOwner(threadId) };
     saveStore(store);
     await sendAI(threadId, `Screenshot ready (${fileLabel(real)}). Reply: 1 = send, 3 = cancel.`);
     return;
@@ -1200,7 +1300,7 @@ async function handleGroupText(threadId, text, msgId) {
   // Everything else -> model interprets naturally (no mechanical guessing)
   const danger = dangerCheck(t, config.workdir, config.extraRoots);
   if (danger && !store.pending[threadId]) {
-    store.pending[threadId] = { kind: "text", text: t, ts: Date.now() };
+    store.pending[threadId] = { kind: "text", text: t, ts: Date.now(), by: getThreadOwner(threadId) };
     saveStore(store);
     await sendAI(threadId, `Dangerous: ${danger} Reply yes to run, no to cancel.`);
     return;
@@ -1209,8 +1309,217 @@ async function handleGroupText(threadId, text, msgId) {
   await runPrompt(threadId, t, false, [], false, msgId !== undefined ? String(msgId) : null);
 }
 
+// Shared bodies for /work + /groups (command handlers and DM soft layer).
+async function doWorkCommand(threadId, raw) {
+  const r = await resolveWorkDir(raw);
+  if (r.error) {
+    await sendAI(threadId, r.error);
+    return;
+  }
+  if (r.dir) {
+    await startWork(threadId, r.dir, raw);
+    return;
+  }
+  const cands = r.candidates.slice(0, 8);
+  store.pending[threadId] = { kind: "pickwork", candidates: cands, purpose: raw, ts: Date.now(), by: getThreadOwner(threadId) };
+  saveStore(store);
+  await sendAI(threadId, `Nhiều project trùng tên:\n${cands.map((d, i) => `${i + 1}. ${d}`).join("\n")}\nNhắn số để mở nhóm.`);
+}
+
+async function doGroupsCommand(threadId) {
+  const entries = Object.entries(store.projectGroups ?? {});
+  if (!entries.length) {
+    await sendAI(threadId, "Chưa có nhóm project nào. DM: /work <path> để mở.");
+    return;
+  }
+  const fmtTs = (ts) => {
+    if (!ts) return "?";
+    const d = new Date(ts);
+    return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")} ${d.getDate()}/${d.getMonth() + 1}`;
+  };
+  await sendAI(
+    threadId,
+    `Nhóm project (${entries.length}):\n${entries
+      .map(([k, pg], i) => `${i + 1}. ${pg.name ?? k}${pg.purpose ? ` — ${pg.purpose}` : ""} (dùng cuối ${fmtTs(pg.lastUsed)})`)
+      .join("\n")}\nDM /work <path> để mở/tiếp tục.`
+  );
+}
+
+const DM_GREETINGS = new Set(["chao", "hi", "hello", "hey", "yo", "alo", "xin chao", "chao em", "chao bot", "em oi", "bot oi", "hi bot", "hello bot", "chao ban", "good morning", "good evening"]);
+function isDMGreeting(t) {
+  const w = norm(t.trim()).replace(/[ .!?,]+$/g, "");
+  return w.length <= 24 && DM_GREETINGS.has(w);
+}
+// Layer 1 (free, instant): smart templates. Returns true when fully handled;
+// false falls through to the AI dispatcher (Layer 2).
+async function handleDMsoft(threadId, t) {
+  const nn = norm(t);
+  if (isDMGreeting(t)) {
+    await sendAI(
+      threadId,
+      `Chào bạn! Mình là bot điều phối việc cho máy tính này.\n- Mở nhóm làm việc: nhắn tên project hoặc /work <đường dẫn> (vd /work E:\\Projects\\X)\n- Xem nhóm đang có: /groups (hoặc nhắn "nhóm")\n- Hẹn giờ: /task in 30m | <việc>\nCứ nói tự nhiên nhé, câu nào mình không hiểu thì mình hỏi AI phụ.`
+    );
+    return true;
+  }
+  if (/\b(help|giup|tro giup|huong dan|lenh|danh sach lenh)\b/.test(nn)) {
+    await sendAI(
+      threadId,
+      "DM điều phối:\n/work <path> - Mở/tiếp tục nhóm project (vd /work E:\\Projects\\X)\n/groups - Nhóm project đang quản lý\n/task in 30m | <việc> - Hẹn giờ\nHoặc nhắn thẳng tên project / đường dẫn, mình tự mở nhóm.\nChat việc trong nhóm project nhé."
+    );
+    return true;
+  }
+  if (/\b(nhom|nhom nao|group|ds nhom|danh sach)\b/.test(nn) && !/\b(tao|mo|them|work)\b/.test(nn)) {
+    await doGroupsCommand(threadId);
+    return true;
+  }
+  // Path-like or project-name-like text -> run the /work flow directly.
+  const raw = t.replace(/^["']|["']$/g, "").trim();
+  const looksPath = /[A-Za-z]:\\|\//.test(t);
+  if (looksPath || raw.length <= 60) {
+    const r = await resolveWorkDir(raw);
+    if (r.error) {
+      if (looksPath) {
+        await sendAI(threadId, r.error); // explicit path that resolves nowhere: clear error
+        return true;
+      }
+      return false; // plain chat that happens to be short -> AI dispatcher
+    }
+    await doWorkCommand(threadId, raw);
+    return true;
+  }
+  return false;
+}
+
 // Zalo-only system prompt lives in ./flows/system-prompt.js (terminal unaffected)
-const KNOWN_COMMANDS = ["/help", "/status", "/new", "/abort", "/ok", "/dir", "/projects", "/sessions", "/model", "/variant", "/agent", "/rename", "/compact", "/commands", "/skills", "/mcps", "/messages", "/revert", "/fork", "/undo", "/redo", "/ls", "/queue", "/file", "/shot", "/task", "/tasklist", "/taskdel", "/opencode_start", "/opencode_stop", "/opencode_restart", "/shutdown", "/reboot", "/cancel-shutdown"];
+const KNOWN_COMMANDS = ["/help", "/status", "/new", "/abort", "/ok", "/dir", "/projects", "/sessions", "/model", "/variant", "/agent", "/rename", "/compact", "/commands", "/skills", "/mcps", "/messages", "/revert", "/fork", "/undo", "/redo", "/ls", "/queue", "/file", "/shot", "/task", "/tasklist", "/taskdel", "/opencode_start", "/opencode_stop", "/opencode_restart", "/shutdown", "/reboot", "/cancel-shutdown", "/work", "/groups"];
+
+// DM dispatcher: one auto-managed group per project (keyed by lowercase dir).
+function projectKey(dir) {
+  return String(dir ?? "").toLowerCase();
+}
+function purposeOfThread(threadId) {
+  for (const pg of Object.values(store.projectGroups ?? {})) {
+    if (String(pg?.groupId) === String(threadId)) return pg.purpose ?? "";
+  }
+  return "";
+}
+// Resolve /work argument: full path -> top-folder name -> opencode project basename.
+async function resolveWorkDir(raw) {
+  const direct = resolveSafePath(raw);
+  if (direct) {
+    try {
+      if (fs.statSync(direct).isDirectory()) return { dir: direct };
+    } catch {}
+  }
+  if (/^[A-Za-z]:\\/.test(raw)) return { error: `Folder does not exist: '${raw}'.` };
+  const hit = listTopDirs().find((d) => norm(d) === norm(raw));
+  if (hit) {
+    const abs = resolveSafePath(hit);
+    if (abs) return { dir: abs };
+  }
+  try {
+    const projs = await listProjects(client);
+    const q = norm(raw);
+    const matches = (projs ?? []).filter((p) => {
+      const base = String(p.worktree ?? "").split(/[/\\]/).filter(Boolean).pop() ?? "";
+      return norm(base) === q || norm(String(p.name ?? "")) === q;
+    });
+    if (matches.length === 1) return { dir: matches[0].worktree };
+    if (matches.length > 1) return { candidates: matches.map((p) => p.worktree) };
+  } catch {}
+  return { error: `Project '${raw}' not found. Send /groups to see managed ones, or /work <full-path>.` };
+}
+// Open (or reuse) the project group, ensure its session, post status header.
+async function startWork(dmThreadId, dir, purpose) {
+  if (!store.projectGroups) store.projectGroups = {};
+  const key = projectKey(dir);
+  const base = dir.split(/[/\\]/).filter(Boolean).pop() ?? dir;
+  const name = `[Bot] ${base}`;
+  let groupId = null;
+  let reused = false;
+  const prev = store.projectGroups[key];
+  if (prev?.groupId) {
+    try {
+      const info = await api.getGroupInfo([prev.groupId]);
+      if (info?.gridInfoMap?.[prev.groupId]) {
+        groupId = prev.groupId;
+        reused = true;
+      } else {
+        delete store.projectGroups[key]; // disbanded -> recreate below
+      }
+    } catch {
+      groupId = prev.groupId; // API hiccup -> assume usable, fail loudly later
+      reused = true;
+    }
+  }
+  if (!groupId) {
+    const requester = getThreadOwner(dmThreadId) ?? config.ownerIds[0] ?? null;
+    // Reconcile: mapping lost but the group still exists? Adopt the bot-owned
+    // "[Bot] <base>" 2-member group instead of creating a duplicate.
+    try {
+      const all = await api.getAllGroups();
+      const ids = Object.keys(all?.gridVerMap ?? {});
+      if (ids.length) {
+        const info = await api.getGroupInfo(ids);
+        const map = info?.gridInfoMap ?? {};
+        for (const id of ids) {
+          const g = map[id];
+          if (!g || g.name !== name || Number(g.totalMember) !== 2) continue;
+          const members = g.memVerList ?? [];
+          if (requester && !members.some((m) => String(m).startsWith(String(requester)))) continue;
+          groupId = id;
+          reused = true;
+          console.log(`[bridge] Adopted existing group ${name} (${id}).`);
+          break;
+        }
+      }
+    } catch (e) {
+      console.log("[bridge] reconcile scan failed:", e?.message ?? e);
+    }
+  }
+  if (!groupId) {
+    const requester = getThreadOwner(dmThreadId) ?? config.ownerIds[0] ?? null;
+    await sendAI(dmThreadId, `Creating group ${name}...`);
+    try {
+      const res = await api.createGroup({ name, members: requester ? [requester] : [] });
+      if (!res?.groupId) {
+        throw new Error(res?.errorMembers?.length ? `invite refused (${res.errorMembers.join(",")})` : "no groupId returned");
+      }
+      groupId = res.groupId;
+    } catch (e) {
+      await sendAI(dmThreadId, `Tạo nhóm thất bại: ${String(e?.message ?? e).slice(0, 200)}. Bạn tạo tay nhóm 2 người (bạn + bot) rồi nhắn /work lại.`);
+      return;
+    }
+  }
+  setThreadType(groupId, ThreadType.Group);
+  if (!store.threadTypes) store.threadTypes = {};
+  store.threadTypes[String(groupId)] = ThreadType.Group;
+  store.dirs[groupId] = dir;
+  let sid = store.sessions[groupId] ?? null;
+  try {
+    if (sid && !(await getSession(client, sid, dir).catch(() => null))) sid = null;
+  } catch {
+    sid = null;
+  }
+  if (!sid) {
+    sid = await getOrCreateSession(client, store, groupId, name);
+    store.sessions[groupId] = sid;
+  }
+  store.projectGroups[key] = {
+    groupId,
+    name,
+    purpose: String(purpose ?? prev?.purpose ?? "").slice(0, 120),
+    createdAt: prev?.createdAt ?? Date.now(),
+    lastUsed: Date.now(),
+  };
+  saveStore(store);
+  const header = await buildStatusHeader(client, store, groupId, { purpose: store.projectGroups[key].purpose });
+  await sendAI(groupId, `${header}\n📌 Bạn ghim tay tin này giúp nhé (Zalo không cho bot tự ghim).`);
+  await sendAI(
+    dmThreadId,
+    reused ? `Nhóm ${name} vẫn còn, header mới đã gửi vào nhóm. Vào đó làm tiếp nhé.` : `Tạo nhóm ${name} xong. Vào đó chat tiếp nhé — mọi việc làm ở đó.`
+  );
+}
 
 // Prompt lifecycle (run/start/flush/fire/deliver) lives in ./flows/prompt.js
 
@@ -1248,10 +1557,14 @@ async function onSSE(ev) {
         await handlePermAsked(threadId, dir, ev.properties ?? ev, sid);
         break;
       case "permission.replied": {
-        // Server da xu ly (noi khac duyet) -> xoa pending trung
+        // Server da xu ly (noi khac duyet / user replied) -> xoa pending trung
         const rid = ev?.properties?.requestID;
         const cur = store.pending[threadId];
-        if (cur?.kind === "perm" && (!rid || cur.requestID === rid)) {
+        if (cur?.kind === "permQueue" && rid) {
+          cur.items = (cur.items ?? []).filter((it) => it.requestID !== rid);
+          if (!cur.items.length) delete store.pending[threadId];
+          saveStore(store);
+        } else if (cur?.kind === "perm" && (!rid || cur.requestID === rid)) {
           delete store.pending[threadId];
           saveStore(store);
         }
@@ -1271,7 +1584,7 @@ async function onSSE(ev) {
 // Background notifications for known but unmapped sessions
 async function bgNotify(sid, ev) {
   try {
-    const groupId = config.groupId;
+    const groupId = notifyTarget();
     if (!groupId) return;
     let known = store.known?.[sid];
     if (!known) {
@@ -1347,24 +1660,74 @@ function isExecFile(p) {
   return EXEC_EXTS.has(ext);
 }
 
+function isOwnMessage(message) {
+  if (message?.isSelf) return true;
+  const uid = message?.data?.uidFrom;
+  return !!uid && !!ownUid && String(uid) === String(ownUid);
+}
+
 function ingestMessage(message) {
   try {
-    if (message?.type !== ThreadType.Group) return;
+    const msgType = message?.type;
+    if (msgType !== ThreadType.Group && msgType !== ThreadType.User) return;
     const threadId = message.threadId;
-    if (config.groupId && threadId !== config.groupId) return;
+    if (isDual) {
+      // Dedicated bot: uid tells bot/user apart, so no prefix guard needed
+      // and user text starting with AI: is NOT swallowed. Empty whitelist
+      // (default) = listen to all groups + DMs the bot joins.
+      if (!isThreadAllowed(threadId)) return;
+      if (isOwnMessage(message)) {
+        // Record cliMsgId of own bubbles (for progress bubble delete).
+        const d = message?.data;
+        if (d?.msgId !== undefined && d?.cliMsgId !== undefined) {
+          sentCli[String(d.msgId)] = String(d.cliMsgId);
+          const ks = Object.keys(sentCli);
+          if (ks.length > 100) delete sentCli[ks[0]];
+        }
+        return;
+      }
+      // Owner auth (fail-closed): without ownUid we can't tell bot from user
+      // (loop risk), and without ownerIds anyone could drive the whole PC.
+      // Strangers are dropped SILENTLY (no reply = no oracle, no spam loop).
+      if (!ownUid) {
+        console.log("[bridge] Dual mode without ownUid - dropping message (loop risk).");
+        return;
+      }
+      const sender = message?.data?.uidFrom;
+      if (!isOwner(sender)) {
+        console.log(`[bridge] Non-owner message dropped (uid=${String(sender ?? "?").slice(-6)} thread=${String(threadId).slice(-6)}).`);
+        return;
+      }
+      setThreadOwner(threadId, sender);
+    } else {
+      if (message?.type !== ThreadType.Group) return;
+      if (config.groupId && threadId !== config.groupId) return;
+      // Single: sender is always the owner (solo group, own account).
+      setThreadOwner(threadId, message?.data?.uidFrom ?? ownUid);
+    }
+    setThreadType(threadId, msgType);
+    // Persist type so post-restart sends (tasks/bgNotify/deliver to DMs) work.
+    if (!store.threadTypes) store.threadTypes = {};
+    store.threadTypes[String(threadId)] = msgType;
+    touchRecent(threadId, msgType);
+    // Immediate typing (<1s feedback) - prog.start repeats it every 3s.
+    try {
+      api?.sendTypingEvent?.(threadId, msgType)?.catch?.(() => {});
+    } catch {}
     const content = message?.data?.content;
     const msgId = message?.data?.msgId ?? `${message?.data?.cliMsgId}-${Date.now()}`;
     if (alreadySeen(store, String(msgId))) return;
     markSeen(store, String(msgId));
     saveStore(store);
-    // Loop guard: bridge's own bubbles always carry the AI: prefix
-    // (sendAINow tags every part, including continuations "(i/N)").
-    // NOTE: isSelf/uidFrom can NOT be used here - the bridge logs in as the
-    // user's own account, so the user's phone messages are "self" too.
+    // Loop guard (single shared account): bridge's own bubbles always carry
+    // the AI: prefix (sendAINow tags every part, including "(i/N)").
+    // NOTE: isSelf/uidFrom can NOT be used in single mode - the bridge logs
+    // in as the user's own account, so phone messages are "self" too.
+    // Dual mode already filtered own messages by uid above: no prefix check.
     if (typeof content === "string") {
       const text = content;
       if (!text.trim()) return;
-      if (text.trim().startsWith(config.prefix)) {
+      if (!isDual && text.trim().startsWith(config.prefix)) {
         // Record cliMsgId of own AI: messages (for progress bubble delete)
         const d = message?.data;
         if (d?.msgId !== undefined && d?.cliMsgId !== undefined) {
@@ -1376,7 +1739,7 @@ function ingestMessage(message) {
       }
       console.log(`[bridge] New text message (${String(msgId).slice(-6)}): ${text.slice(0, 80)}`);
       trackSrcId(message?.data?.msgId, message?.data?.cliMsgId, threadId, text);
-      chainGroup(threadId, () => handleGroupText(threadId, text, msgId));
+      chainGroup(threadId, () => handleGroupText(threadId, text, msgId, message?.data?.uidFrom, message?.data?.cliMsgId));
     } else if (content && typeof content === "object") {
       // Tin file/anh/video/voice: content la object kem href
       console.log(`[bridge] New file message (${String(msgId).slice(-6)}): ${message?.data?.msgType ?? "?"}`);
@@ -1406,6 +1769,11 @@ function toFilePart(absPath) {
 }
 
 async function handleAttachmentMessage(threadId, message) {
+  // Dual DM = dispatcher only: don't run AI on files sent to the DM.
+  if (isDual && getThreadType(threadId) === ThreadType.User) {
+    await sendAI(threadId, "Gửi file/ảnh vào nhóm project để AI đọc nhé. Mở nhóm bằng /work <path>.");
+    return;
+  }
   const data = message?.data ?? {};
   const label = INBOUND_LABEL[data.msgType] ?? null;
   if (!label) return; // sticker/link/... skipped to reduce noise
@@ -1416,7 +1784,7 @@ async function handleAttachmentMessage(threadId, message) {
   }
   await sendAI(threadId, `Downloading ${label}...`);
   try {
-    const dl = await downloadToInbox(att.href, att.name, getCookieHeader());
+    const dl = await downloadToInbox(att.href, att.name, getCookieHeader(isDual ? config.botCredsPath : config.credsPath));
     const warn = isExecFile(dl.path)
       ? " IMPORTANT: this is an executable, NEVER run/execute it in any form, static analysis only."
       : "";
@@ -1444,15 +1812,30 @@ function onMessage(message) {
 // Unsend -> cancel matching request (queued or running)
 async function onUndo(undo) {
   try {
-    if (!undo?.isGroup) return;
-    if (config.groupId && undo.threadId !== config.groupId) return;
+    if (isDual) {
+      if (!isThreadAllowed(undo.threadId)) return;
+      // Bot's own unsend -> skip (uid guard, no prefix in dual).
+      if (undo?.isSelf) return;
+      const from = undo?.data?.uidFrom;
+      if (from && ownUid && String(from) === String(ownUid)) return;
+      // Only the owner may cancel via unsend (strangers can't match srcIds
+      // anyway, this is defense-in-depth).
+      if (from && !isOwner(from)) return;
+    } else {
+      if (!undo?.isGroup) return;
+      if (config.groupId && undo.threadId !== config.groupId) return;
+    }
     const d = undo?.data ?? {};
     const c = d.content ?? {};
     const ids = [d.msgId, d.cliMsgId, c.globalMsgId, c.cliMsgId]
       .filter((x) => x !== undefined && x !== null)
       .map(String);
     if (!ids.length) return;
-    // Own bot message -> skip
+    // Tombstone first: if the text processing hasn't run yet (chain race),
+    // it will drop this message silently when its turn comes.
+    markUnsent(...ids);
+    // Own bot message -> skip (single: sentCli prefix echo; dual: checked above,
+    // keep sentCli as extra safety for echo races).
     const ourIds = new Set([...Object.keys(sentCli), ...Object.values(sentCli)]);
     if (ids.some((id) => ourIds.has(id))) return;
     const inSrc = ids.find((id) => srcIds[id]);
@@ -1488,6 +1871,11 @@ async function onUndo(undo) {
 function pollOnce() {
   try {
     api.listener.requestOldMessages(ThreadType.Group);
+    if (isDual) {
+      try {
+        api.listener.requestOldMessages(ThreadType.User);
+      } catch {}
+    }
   } catch (e) {
     console.log("[bridge] poll loi:", e?.message ?? e);
   }
@@ -1496,7 +1884,8 @@ function pollOnce() {
 function onOldMessages(messages, type) {
   console.log(`[debug] old_messages: count=${messages?.length ?? 0} type=${type}`);
   try {
-    if (type !== ThreadType.Group) return;
+    if (type !== ThreadType.Group && type !== ThreadType.User) return;
+    if (!isDual && type !== ThreadType.Group) return;
     for (const m of [...(messages ?? [])].reverse()) ingestMessage(m);
   } catch (e) {
     console.error("[bridge] old_messages:", e);
@@ -1507,8 +1896,52 @@ initTaskRuntime({ getStore: () => store, getClient: () => client, getProg: () =>
 
 // Task scheduler (timers/sessions/fire) lives in ./tasks/runtime.js
 
+// Single-instance guard: two bridges sharing one store/socket clobber state
+// (this class of bug caused the 11:40 lost-mapping incident).
+const BRIDGE_PID_FILE = path.join(path.dirname(config.storePath), "bridge.pid");
+function claimInstance() {
+  try {
+    const pid = Number(fs.readFileSync(BRIDGE_PID_FILE, "utf-8").trim());
+    if (pid && pid !== process.pid) {
+      try {
+        process.kill(pid, 0); // throws when not alive
+        console.log(`[bridge] Already running (PID ${pid}). Refusing second instance. Stop it first (scripts/restart-bridge.ps1) or delete bridge.pid if stale.`);
+        process.exit(2);
+      } catch {
+        console.log(`[bridge] Stale bridge.pid (${pid}), reclaiming.`);
+      }
+    }
+  } catch {
+    // No pid file - first run.
+  }
+  try {
+    fs.writeFileSync(BRIDGE_PID_FILE, String(process.pid));
+  } catch (e) {
+    console.log("[bridge] Cannot write bridge.pid:", e?.message ?? e);
+  }
+  const release = () => {
+    try {
+      if (Number(fs.readFileSync(BRIDGE_PID_FILE, "utf-8").trim()) === process.pid) fs.unlinkSync(BRIDGE_PID_FILE);
+    } catch {}
+  };
+  process.on("exit", release);
+  process.on("SIGINT", () => process.exit(0));
+  process.on("SIGTERM", () => process.exit(0));
+}
+
 async function main() {
-  if (!config.groupId) {
+  claimInstance();
+  // Auto-detect: bot creds file (or ZALO_MODE=dual) = dedicated bot account
+  // listening to all groups + DMs; otherwise legacy single shared account.
+  isDual = isDualAccount();
+  if (isDual && config.mode === "auto") {
+    console.log("[bridge] Dual-account mode (bot creds found). Listening to all groups + DMs.");
+  } else if (isDual) {
+    console.log("[bridge] Dual-account mode (ZALO_MODE=dual). Listening to all groups + DMs.");
+  } else {
+    console.log("[bridge] Single-account mode (shared acc).");
+  }
+  if (!isDual && !config.groupId) {
     console.log("Missing ZALO_GROUP_ID in .env. Run: npm run find-group to get groupId, then put it in .env");
     process.exit(1);
   }
@@ -1521,16 +1954,20 @@ async function main() {
   console.log("[opencode] serve connected");
 
   // Clear leftovers stuck from a previous run (harmless if idle)
+  // Single: the solo group session. Dual: every known thread session.
   try {
-    const mapped = store.sessions[config.groupId];
-    if (mapped) await abortSession(client, mapped, groupDir(store, config.groupId));
+    const targets = isDual ? Object.keys(store.sessions) : [config.groupId];
+    for (const tid of targets) {
+      const mapped = store.sessions[tid];
+      if (mapped) await abortSession(client, mapped, groupDir(store, tid)).catch(() => {});
+    }
   } catch {}
 
   // SSE from opencode: async results + permission + question
   stopSSE = subscribeEvents(client, onSSE, resyncRuns);
   console.log("[sse] SSE listening on");
 
-  api = await loginZalo();
+  api = isDual ? await loginBot() : await loginZalo();
   try {
     ownUid = api.getOwnId();
     console.log("[zalo] ownUid ok");
@@ -1565,10 +2002,24 @@ async function main() {
   });
   api.listener.on("error", (e) => console.log("[zalo] error", e?.message ?? e));
   api.listener.start();
-  console.log(`[bridge] Listening on group ${config.groupId}. Mobile app only, DO NOT open chat.zalo.me`);
+  if (isDual) {
+    const scope = config.allowedThreads.length ? `whitelist: ${config.allowedThreads.join(",")}` : "all groups + DMs";
+    console.log(`[bridge] Listening as bot (${scope}). Mobile app only, DO NOT open chat.zalo.me`);
+  } else {
+    console.log(`[bridge] Listening on group ${config.groupId}. Mobile app only, DO NOT open chat.zalo.me`);
+  }
 
-  await sendAI(config.groupId, `bridge ready. workdir=${config.workdir} (see /help)`);
-  console.log("[bridge] ready message sent");
+  // Ready ping: single -> solo group (AI: prefixed); dual -> configured
+  // group, else first whitelist entry, else skip until the first message
+  // registers a recent thread.
+  const readyTarget = isDual ? notifyTarget() : config.groupId;
+  const readyText = `bridge ready. workdir=${config.workdir} (see /help)`;
+  if (readyTarget) {
+    await sendAI(readyTarget, readyText);
+    console.log("[bridge] ready message sent");
+  } else {
+    console.log("[bridge] ready (dual, no target yet - will reply on first incoming thread)");
+  }
 
   await pollOnce();
   setInterval(pollOnce, 10000);
@@ -1576,7 +2027,7 @@ async function main() {
 
   refreshFileIndex(); // build nen, khong chan
   setInterval(refreshFileIndex, 600000);
-  startWatchdog(config.groupId); // tu start lai serve khi rot
+  startWatchdog(readyTarget); // tu start lai serve khi rot (null = resolve dong qua notifyTarget)
   console.log("[serve] watchdog on (60s)");
   loadTasksOnBoot(); // reschedule timed tasks
 }

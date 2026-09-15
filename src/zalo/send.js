@@ -9,10 +9,57 @@ import { sentCli } from "../app/run-state.js";
 // bridge.js sets these once after login (avoids circular import of api).
 let _getApi = () => null;
 let _getOwnUid = () => null;
+let _getIsDual = () => false;
+let _getStore = () => null;
 
-export function initSender({ getApi, getOwnUid }) {
+// Per-thread Zalo type (Group vs User/DM). ingestMessage registers it;
+// outgoing calls default to Group for backward compat (single mode).
+const _threadTypes = {};
+
+export function setThreadType(threadId, type) {
+  if (threadId !== undefined && threadId !== null && type !== undefined) {
+    _threadTypes[String(threadId)] = type;
+  }
+}
+
+export function getThreadType(threadId, fallback = ThreadType.Group) {
+  const key = String(threadId);
+  if (_threadTypes[key] !== undefined) return _threadTypes[key];
+  // Survives restarts via store.threadTypes (DM tasks/notifies after reboot).
+  try {
+    const persisted = _getStore()?.threadTypes?.[key];
+    if (persisted !== undefined && persisted !== null) {
+      _threadTypes[key] = persisted;
+      return persisted;
+    }
+  } catch {}
+  return fallback;
+}
+
+export function initSender({ getApi, getOwnUid, getIsDual, getStore }) {
   if (getApi) _getApi = getApi;
   if (getOwnUid) _getOwnUid = getOwnUid;
+  if (getIsDual) _getIsDual = getIsDual;
+  if (getStore) _getStore = getStore;
+}
+
+function isDual() {
+  try {
+    return !!_getIsDual();
+  } catch {
+    return false;
+  }
+}
+
+// Single mode tags every bubble with AI_PREFIX (loop guard + label).
+// Dual mode uses uid for loop guard, so messages stay clean (no prefix).
+function prefixFor() {
+  return isDual() ? "" : config.prefix;
+}
+
+function withTag(text, tag) {
+  const body = String(text ?? "").trim();
+  return tag ? `${tag} ${body}`.trim() : body;
 }
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -42,22 +89,29 @@ async function waitForCli(msgId, timeoutMs) {
 }
 
 // Send a single bubble (return ids for later delete)
-export async function sendBubble(threadId, text) {
+export async function sendBubble(threadId, text, threadType) {
   const api = _getApi();
-  const msg = `${config.prefix} ${String(text ?? "").trim()}`.slice(0, config.maxReplyChars);
-  const res = await zsend(() => api.sendMessage(msg, threadId, ThreadType.Group), "bubble");
+  const type = threadType ?? getThreadType(threadId);
+  const msg = withTag(text, prefixFor()).slice(0, config.maxReplyChars);
+  const res = await zsend(() => api.sendMessage(msg || "…", threadId, type), "bubble");
   const msgId = res?.message?.msgId;
   if (msgId === undefined || msgId === null) throw new Error("no msgId");
   return { msgId: String(msgId), cliMsgId: await waitForCli(String(msgId), 8000) };
 }
 
-export async function deleteBubble(threadId, ids) {
+export async function deleteBubble(threadId, ids, threadType) {
+  // Dual: keep progress bubbles forever (user wants terminal-style history).
+  // deleteMessage(onlyMe) would only erase the BOT's own view anyway while the
+  // user keeps all 15 copies - so skip the API call entirely in dual mode.
+  // Single: erase (same account = viewer), back to zero bubbles.
+  if (isDual()) return true;
   const api = _getApi();
   const ownUid = _getOwnUid();
   if (!ids?.msgId || !ownUid) return false;
+  const type = threadType ?? getThreadType(threadId);
   try {
     await api.deleteMessage(
-      { data: { cliMsgId: ids.cliMsgId ?? ids.msgId, msgId: ids.msgId, uidFrom: ownUid }, threadId, type: ThreadType.Group },
+      { data: { cliMsgId: ids.cliMsgId ?? ids.msgId, msgId: ids.msgId, uidFrom: ownUid }, threadId, type },
       true
     );
     return true;
@@ -67,21 +121,24 @@ export async function deleteBubble(threadId, ids) {
 }
 
 let sendChain = Promise.resolve();
-export function sendAI(threadId, text) {
-  sendChain = sendChain.then(() => sendAINow(threadId, text)).catch((e) => console.error("[bridge] send loi:", e?.message ?? e));
+export function sendAI(threadId, text, threadType) {
+  if (threadType !== undefined) setThreadType(threadId, threadType);
+  sendChain = sendChain.then(() => sendAINow(threadId, text, threadType)).catch((e) => console.error("[bridge] send loi:", e?.message ?? e));
   return sendChain;
 }
 
-export async function sendAINow(threadId, text) {
+export async function sendAINow(threadId, text, threadType) {
   const api = _getApi();
+  const type = threadType ?? getThreadType(threadId);
   const body = String(text ?? "").trim();
-  // Reserve room for the "AI: (i/N) " tag so no bubble exceeds maxReplyChars.
-  // Every part carries the prefix (single messages keep the exact old format),
-  // so continuation parts are still recognizable as bot output.
-  const parts = chunkText(body, config.maxReplyChars - config.prefix.length - 10);
+  const tag = prefixFor();
+  // Reserve room for the tag so no bubble exceeds maxReplyChars.
+  // Single: every part carries AI_PREFIX (loop guard). Dual: clean parts.
+  const budget = config.maxReplyChars - (tag ? tag.length + 10 : 0);
+  const parts = chunkText(body, budget);
   for (let i = 0; i < parts.length; i++) {
-    const tag = parts.length > 1 ? `${config.prefix} (${i + 1}/${parts.length}) ` : `${config.prefix} `;
-    await zsend(() => api.sendMessage(tag + parts[i], threadId, ThreadType.Group), "text");
+    const head = !tag ? "" : parts.length > 1 ? `${tag} (${i + 1}/${parts.length}) ` : `${tag} `;
+    await zsend(() => api.sendMessage(head + parts[i], threadId, type), "text");
     await sleep(config.sendDelayMs);
   }
 }
@@ -108,17 +165,20 @@ export function fmtDur(ms) {
 
 // Send attachments (absolute paths, validated)
 // File lon: bao staged truoc/sau (lib khong co % tien do that)
-export async function sendFiles(threadId, caption, absPaths) {
+export async function sendFiles(threadId, caption, absPaths, threadType) {
   const api = _getApi();
+  const type = threadType ?? getThreadType(threadId);
+  const tag = prefixFor();
+  const fileMsg = (p) => withTag(`file: ${fileLabel(p)}`, tag);
   const paths = absPaths.slice(0, 5);
-  if (caption) await sendAI(threadId, caption);
+  if (caption) await sendAI(threadId, caption, threadType);
   const big = isLargeFile(totalBytes(paths));
   const t0 = Date.now();
-  if (big) await sendAI(threadId, `Sending-KEEP-REMOVE-ME`);
+  if (big) await sendAI(threadId, `Sending-KEEP-REMOVE-ME`, threadType);
   try {
     for (const p of paths) {
       await zsend(
-        () => api.sendMessage({ msg: `${config.prefix} file: ${fileLabel(p)}`, attachments: [p] }, threadId, ThreadType.Group),
+        () => api.sendMessage({ msg: fileMsg(p), attachments: [p] }, threadId, type),
         `file:${fileLabel(p)}`
       );
       await sleep(config.sendDelayMs);
@@ -127,11 +187,11 @@ export async function sendFiles(threadId, caption, absPaths) {
     const msg = e?.message ?? String(e);
     const lim = parseZaloLimit(msg);
     if (lim) {
-      await sendAI(threadId, `Zalo allows files up to ${lim}MB. Yours is ${formatMb(totalBytes(paths))} - try compressing/splitting and resend.`);
+      await sendAI(threadId, `Zalo allows files up to ${lim}MB. Yours is ${formatMb(totalBytes(paths))} - try compressing/splitting and resend.`, threadType);
     } else {
-      await sendAI(threadId, `File send failed: ${msg.slice(0, 300)}`);
+      await sendAI(threadId, `File send failed: ${msg.slice(0, 300)}`, threadType);
     }
     return;
   }
-  if (big) await sendAI(threadId, `Sent (${fmtDur(Date.now() - t0)}).`);
+  if (big) await sendAI(threadId, `Sent (${fmtDur(Date.now() - t0)}).`, threadType);
 }

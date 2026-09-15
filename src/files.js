@@ -71,6 +71,17 @@ export function isOutsideScope(p) {
   return sensitivity(p) === "forbidden";
 }
 
+// True while the path still exists on disk as a directory.
+// Project/session lists merge serve data + old sessions + known cache, all of
+// which keep pointing at folders deleted outside the bridge - filter with this.
+export function aliveDir(wt) {
+  try {
+    return !!wt && fs.statSync(wt).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 // Validate outgoing file: exists + is file + within size cap
 export function checkSendable(absPath) {
   const hit = statAnyForm(absPath);

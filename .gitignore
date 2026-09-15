@@ -1,9 +1,12 @@
 node_modules/
 .zalo-creds.json
+.zalo-creds-bot.json
 .bridge-store.json
 .bridge-store.json.bak
 .bridge-store.json.tmp
 zalo-qr.png
+zalo-qr-bot.png
+bridge.pid
 .env
 *.log
 .serve.pid

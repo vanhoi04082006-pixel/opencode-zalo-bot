@@ -19,6 +19,36 @@ export function trackSrcId(msgId, cliMsgId, threadId, preview) {
   if (ks.length > 300) delete srcIds[ks[0]];
 }
 
+// Unsent message ids (onUndo tombstones): handleGroupText/flushQueue drop
+// them silently. Fixes the race where unsend runs BEFORE the chained text
+// processing - without this the retracted message still gets queued/executed.
+export const unsentIds = new Set();
+export function markUnsent(...ids) {
+  for (const id of ids) {
+    if (id === undefined || id === null) continue;
+    unsentIds.add(String(id));
+  }
+  while (unsentIds.size > 300) {
+    unsentIds.delete(unsentIds.values().next().value);
+  }
+}
+export function isUnsent(id) {
+  return id !== undefined && id !== null && unsentIds.has(String(id));
+}
+
+// Last sender uid per thread (set on every ingest). Pending confirmations
+// stamp `by` from this so only the creator (or another owner) can consume
+// 1/2/3/yes replies - strangers can't race-approve shutdown/perm/file sends.
+export const threadOwners = {}; // threadId -> uid
+export function setThreadOwner(threadId, uid) {
+  if (threadId === undefined || threadId === null) return;
+  if (uid === undefined || uid === null) return;
+  threadOwners[String(threadId)] = String(uid);
+}
+export function getThreadOwner(threadId) {
+  return threadOwners[String(threadId)] ?? null;
+}
+
 export function chainGroup(threadId, fn) {
   chains[threadId] = (chains[threadId] ?? Promise.resolve())
     .then(fn)

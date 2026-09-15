@@ -1,12 +1,15 @@
 {
   "name": "zalo-opencode-bridge",
   "version": "0.1.0",
-  "description": "Control opencode via Zalo - solo group, AI: prefix",
+  "description": "Control opencode via Zalo - single shared acc or dedicated bot acc",
   "type": "module",
   "scripts": {
     "bridge": "node src/bridge.js",
     "find-group": "node src/find-group.js",
-    "serve": "opencode serve --port 4096 --hostname 127.0.0.1"
+    "find-group:bot": "node src/find-group.js --bot",
+    "serve": "opencode serve --port 4096 --hostname 127.0.0.1",
+    "test": "node scripts/test-perm-queue.mjs",
+    "restart": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/restart-bridge.ps1"
   },
   "dependencies": {
     "@opencode-ai/sdk": "^1.18.29",
