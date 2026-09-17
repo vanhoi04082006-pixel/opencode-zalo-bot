@@ -41,7 +41,7 @@ import {
 } from "./flows/interaction.js";
 import { detectShutdownIntent, detectDirIntent } from "./intent.js";
 import { buildStatusHeader } from "./flows/status.js";
-import { DISPATCHER_SYSTEM } from "./flows/system-prompt.js";
+import { CENTER_SYSTEM } from "./flows/system-prompt.js";
 import { execFile, spawn } from "node:child_process";
 import { listTopDirs, buildIndex, searchFiles, norm } from "./filefind.js";
 import { parseSchedule, describeTask, fmtTime } from "./tasks.js";
@@ -417,14 +417,13 @@ async function handleGroupText(threadId, text, msgId, uid, cliMsgId) {
   // Pending-interaction replies (confirm/perm/qa/pick/...) live in ./flows/interaction.js
   if (await tryConsumePending(threadId, t, isCmd, uid)) return;
 
-  // Dual DM: dispatcher. Layer 1 = free smart templates; Layer 2 = AI
-  // dispatcher fallback (short natural chat). Real work stays in groups.
+  // Dual DM = command center rooted at E:\ (full commands + quick tasks).
+  // Group creation NEVER happens implicitly here - only via explicit /work
+  // with a full path, or confirm-work after picking from a list.
   const isDM = isDual && getThreadType(threadId) === ThreadType.User;
-  const dmAllowed =
-    t === "/work" || t.startsWith("/work ") || t === "/groups" || t === "/help" || t === "/task" || t.startsWith("/task ") || t === "/tasklist" || t.startsWith("/taskdel");
-  if (isDM && !dmAllowed) {
+  if (isDM && !isCmd) {
     if (await handleDMsoft(threadId, t)) return;
-    await runPrompt(threadId, t, false, [], false, msgId !== undefined ? String(msgId) : null, DISPATCHER_SYSTEM);
+    await runPrompt(threadId, t, false, [], false, msgId !== undefined ? String(msgId) : null, CENTER_SYSTEM);
     return;
   }
 
@@ -437,7 +436,7 @@ async function handleGroupText(threadId, text, msgId, uid, cliMsgId) {
     if (isDM) {
       await sendAI(
         threadId,
-        "DM điều phối:\n/work <path> - Mở/tiếp tục nhóm project (vd /work E:\\Projects\\X)\n/groups - Nhóm project đang quản lý\n/help - Trợ giúp\nChat việc trong nhóm project nhé."
+        "Trung tâm điều khiển (scope E:\\):\n- Việc nhanh: nhắn thẳng ở đây, mình làm luôn (đóng/mở app, /shot, /file, hỏi đáp, gửi ảnh để đọc)\n- /work <path đủ> - Mở nhóm project mới\n- /projects - Chọn project từ danh sách rồi mở nhóm\n- /groups - Nhóm project đang quản lý\n- /status /sessions /dir /ls /model - Dùng trực tiếp ở đây\n- /task in 30m | <việc> - Hẹn giờ"
       );
       return;
     }
@@ -1332,15 +1331,27 @@ async function doGroupsCommand(threadId) {
     await sendAI(threadId, "Chưa có nhóm project nào. DM: /work <path> để mở.");
     return;
   }
+  // Verify liveness in one batched call (report only - fixes happen in /work).
+  let states = {};
+  try {
+    const ids = entries.map(([, pg]) => pg.groupId).filter(Boolean);
+    if (ids.length) {
+      const info = await api.getGroupInfo(ids);
+      const map = info?.gridInfoMap ?? {};
+      const me = getThreadOwner(threadId) ?? config.ownerIds[0] ?? null;
+      for (const id of ids) states[id] = classifyGroupState(map, id, me);
+    }
+  } catch {}
   const fmtTs = (ts) => {
     if (!ts) return "?";
     const d = new Date(ts);
     return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")} ${d.getDate()}/${d.getMonth() + 1}`;
   };
+  const stateNote = (s) => (s === "ok" ? "" : s === "owner-left" ? " [bạn đã rời - /work để mời lại]" : s === "gone" ? " [đã giải tán - /work để tạo lại]" : "");
   await sendAI(
     threadId,
     `Nhóm project (${entries.length}):\n${entries
-      .map(([k, pg], i) => `${i + 1}. ${pg.name ?? k}${pg.purpose ? ` — ${pg.purpose}` : ""} (dùng cuối ${fmtTs(pg.lastUsed)})`)
+      .map(([k, pg], i) => `${i + 1}. ${pg.name ?? k}${pg.purpose ? ` — ${pg.purpose}` : ""} (dùng cuối ${fmtTs(pg.lastUsed)})${stateNote(states[pg.groupId])}`)
       .join("\n")}\nDM /work <path> để mở/tiếp tục.`
   );
 }
@@ -1351,20 +1362,23 @@ function isDMGreeting(t) {
   return w.length <= 24 && DM_GREETINGS.has(w);
 }
 // Layer 1 (free, instant): smart templates. Returns true when fully handled;
-// false falls through to the AI dispatcher (Layer 2).
+// false falls through to the AI command center (Layer 2).
+// NEVER creates groups here - creation needs an explicit full path (/work)
+// or a confirmed pick (confirm-work). Casual words matching folder names
+// must not cause surprise group creation.
 async function handleDMsoft(threadId, t) {
   const nn = norm(t);
   if (isDMGreeting(t)) {
     await sendAI(
       threadId,
-      `Chào bạn! Mình là bot điều phối việc cho máy tính này.\n- Mở nhóm làm việc: nhắn tên project hoặc /work <đường dẫn> (vd /work E:\\Projects\\X)\n- Xem nhóm đang có: /groups (hoặc nhắn "nhóm")\n- Hẹn giờ: /task in 30m | <việc>\nCứ nói tự nhiên nhé, câu nào mình không hiểu thì mình hỏi AI phụ.`
+      `Chào bạn! Mình là trung tâm điều khiển máy này (scope E:\\).\n- Việc nhanh (đóng app, tra cứu, hỏi đáp): nhắn thẳng ở đây, mình làm luôn.\n- Việc project dài hơi: /work <đường dẫn đầy đủ> để mở nhóm, hoặc /projects rồi chọn số.\n- Xem nhóm đang có: /groups.`
     );
     return true;
   }
-  if (/\b(help|giup|tro giup|huong dan|lenh|danh sach lenh)\b/.test(nn)) {
+  if (/\b(help|giup|tro giup|huong dan|lenh|danh sach lenh|em lam duoc gi|giup duoc gi)\b/.test(nn)) {
     await sendAI(
       threadId,
-      "DM điều phối:\n/work <path> - Mở/tiếp tục nhóm project (vd /work E:\\Projects\\X)\n/groups - Nhóm project đang quản lý\n/task in 30m | <việc> - Hẹn giờ\nHoặc nhắn thẳng tên project / đường dẫn, mình tự mở nhóm.\nChat việc trong nhóm project nhé."
+      "DM điều phối:\n/work <path đủ> - Mở nhóm project mới\n/projects - Chọn project từ danh sách rồi mở nhóm\n/groups - Nhóm project đang quản lý\n/task in 30m | <việc> - Hẹn giờ\n/status /sessions /dir /ls /file /shot - Dùng trực tiếp ở đây\nViệc nhanh mình làm luôn tại đây; việc dài thì mở nhóm nhé."
     );
     return true;
   }
@@ -1372,20 +1386,33 @@ async function handleDMsoft(threadId, t) {
     await doGroupsCommand(threadId);
     return true;
   }
-  // Path-like or project-name-like text -> run the /work flow directly.
+  // Explicit full path only -> run the /work flow directly.
   const raw = t.replace(/^["']|["']$/g, "").trim();
-  const looksPath = /[A-Za-z]:\\|\//.test(t);
-  if (looksPath || raw.length <= 60) {
-    const r = await resolveWorkDir(raw);
-    if (r.error) {
-      if (looksPath) {
-        await sendAI(threadId, r.error); // explicit path that resolves nowhere: clear error
-        return true;
-      }
-      return false; // plain chat that happens to be short -> AI dispatcher
-    }
+  if (/[A-Za-z]:\\|\//.test(t)) {
     await doWorkCommand(threadId, raw);
     return true;
+  }
+  // Bare name matching project(s) -> suggest, never auto-create.
+  if (raw.length <= 60) {
+    try {
+      const projs = await listProjects(client);
+      const q = norm(raw);
+      const matches = (projs ?? []).filter((p) => {
+        const base = String(p.worktree ?? "").split(/[/\\]/).filter(Boolean).pop() ?? "";
+        return norm(base) === q || norm(String(p.name ?? "")) === q;
+      });
+      if (matches.length === 1) {
+        await sendAI(threadId, `Ý bạn là project ${matches[0].worktree}? Nhắn /work ${matches[0].worktree} để mở nhóm, hoặc /projects để chọn từ danh sách.`);
+        return true;
+      }
+      if (matches.length > 1) {
+        const cands = matches.slice(0, 8).map((p) => p.worktree);
+        store.pending[threadId] = { kind: "pickwork", candidates: cands, purpose: raw, ts: Date.now(), by: getThreadOwner(threadId) };
+        saveStore(store);
+        await sendAI(threadId, `Nhiều project trùng tên:\n${cands.map((d, i) => `${i + 1}. ${d}`).join("\n")}\nNhắn số để chọn (chọn xong mình hỏi lại trước khi tạo nhóm).`);
+        return true;
+      }
+    } catch {}
   }
   return false;
 }
@@ -1393,10 +1420,8 @@ async function handleDMsoft(threadId, t) {
 // Zalo-only system prompt lives in ./flows/system-prompt.js (terminal unaffected)
 const KNOWN_COMMANDS = ["/help", "/status", "/new", "/abort", "/ok", "/dir", "/projects", "/sessions", "/model", "/variant", "/agent", "/rename", "/compact", "/commands", "/skills", "/mcps", "/messages", "/revert", "/fork", "/undo", "/redo", "/ls", "/queue", "/file", "/shot", "/task", "/tasklist", "/taskdel", "/opencode_start", "/opencode_stop", "/opencode_restart", "/shutdown", "/reboot", "/cancel-shutdown", "/work", "/groups"];
 
-// DM dispatcher: one auto-managed group per project (keyed by lowercase dir).
-function projectKey(dir) {
-  return String(dir ?? "").toLowerCase();
-}
+// DM dispatcher: one auto-managed group per project (keyed by lowercase dir,
+// see projectKey in ./flows/groups.js).
 function purposeOfThread(threadId) {
   for (const pg of Object.values(store.projectGroups ?? {})) {
     if (String(pg?.groupId) === String(threadId)) return pg.purpose ?? "";
@@ -1429,27 +1454,44 @@ async function resolveWorkDir(raw) {
   } catch {}
   return { error: `Project '${raw}' not found. Send /groups to see managed ones, or /work <full-path>.` };
 }
+// Group lifecycle from the bot's view lives in ./flows/groups.js (pure, tested).
+import { classifyGroupState, projectKey } from "./flows/groups.js";
 // Open (or reuse) the project group, ensure its session, post status header.
 async function startWork(dmThreadId, dir, purpose) {
   if (!store.projectGroups) store.projectGroups = {};
   const key = projectKey(dir);
   const base = dir.split(/[/\\]/).filter(Boolean).pop() ?? dir;
   const name = `[Bot] ${base}`;
+  const requester = getThreadOwner(dmThreadId) ?? config.ownerIds[0] ?? null;
   let groupId = null;
   let reused = false;
+  let reinvited = false;
   const prev = store.projectGroups[key];
   if (prev?.groupId) {
+    let state = "gone";
     try {
       const info = await api.getGroupInfo([prev.groupId]);
-      if (info?.gridInfoMap?.[prev.groupId]) {
+      state = classifyGroupState(info?.gridInfoMap, prev.groupId, requester);
+    } catch {
+      state = "gone-assumed-usable"; // API hiccup -> assume usable, fail loudly later
+    }
+    if (state === "ok" || state === "gone-assumed-usable") {
+      groupId = prev.groupId;
+      reused = true;
+    } else if (state === "owner-left") {
+      // Owner left the group: re-invite, then reuse.
+      try {
+        const res = await api.addUserToGroup(requester, prev.groupId);
+        if ((res?.errorMembers ?? []).length) throw new Error(`invite refused (${res.errorMembers.join(",")})`);
         groupId = prev.groupId;
         reused = true;
-      } else {
-        delete store.projectGroups[key]; // disbanded -> recreate below
+        reinvited = true;
+      } catch (e) {
+        await sendAI(dmThreadId, `Bạn đã rời nhóm ${name} mà mình mời lại không được (${String(e?.message ?? e).slice(0, 150)}). Bạn vào tay nhóm rồi nhắn /work lại nhé.`);
+        return;
       }
-    } catch {
-      groupId = prev.groupId; // API hiccup -> assume usable, fail loudly later
-      reused = true;
+    } else {
+      delete store.projectGroups[key]; // disbanded (or bot kicked) -> recreate below
     }
   }
   if (!groupId) {
@@ -1478,7 +1520,6 @@ async function startWork(dmThreadId, dir, purpose) {
     }
   }
   if (!groupId) {
-    const requester = getThreadOwner(dmThreadId) ?? config.ownerIds[0] ?? null;
     await sendAI(dmThreadId, `Creating group ${name}...`);
     try {
       const res = await api.createGroup({ name, members: requester ? [requester] : [] });
@@ -1487,7 +1528,7 @@ async function startWork(dmThreadId, dir, purpose) {
       }
       groupId = res.groupId;
     } catch (e) {
-      await sendAI(dmThreadId, `Tạo nhóm thất bại: ${String(e?.message ?? e).slice(0, 200)}. Bạn tạo tay nhóm 2 người (bạn + bot) rồi nhắn /work lại.`);
+      await sendAI(dmThreadId, `Tạo nhóm thất bại: ${String(e?.message ?? e).slice(0, 200)}. Bạn tạo tay nhóm 2 người (bạn + bot) rồi nhắn /work lại. Nếu thấy 2 nhóm trùng tên thì xóa tay nhóm cũ giúp.`);
       return;
     }
   }
@@ -1517,7 +1558,11 @@ async function startWork(dmThreadId, dir, purpose) {
   await sendAI(groupId, `${header}\n📌 Bạn ghim tay tin này giúp nhé (Zalo không cho bot tự ghim).`);
   await sendAI(
     dmThreadId,
-    reused ? `Nhóm ${name} vẫn còn, header mới đã gửi vào nhóm. Vào đó làm tiếp nhé.` : `Tạo nhóm ${name} xong. Vào đó chat tiếp nhé — mọi việc làm ở đó.`
+    reinvited
+      ? `Bạn đã rời nhóm ${name}, mình đã mời lại. Vào nhóm làm tiếp nhé.`
+      : reused
+        ? `Nhóm ${name} vẫn còn, header mới đã gửi vào nhóm. Vào đó làm tiếp nhé.`
+        : `Tạo nhóm ${name} xong. Vào đó chat tiếp nhé — mọi việc làm ở đó.`
   );
 }
 
@@ -1696,6 +1741,16 @@ function ingestMessage(message) {
       const sender = message?.data?.uidFrom;
       if (!isOwner(sender)) {
         console.log(`[bridge] Non-owner message dropped (uid=${String(sender ?? "?").slice(-6)} thread=${String(threadId).slice(-6)}).`);
+        // Mark seen so poll replays don't re-log the same stranger message.
+        // (touchRecent/setThreadType stay below the gate: stranger threads
+        // must never become notify/send targets.)
+        try {
+          const mid = message?.data?.msgId ?? message?.data?.cliMsgId;
+          if (mid !== undefined && mid !== null && !alreadySeen(store, String(mid))) {
+            markSeen(store, String(mid));
+            saveStore(store);
+          }
+        } catch {}
         return;
       }
       setThreadOwner(threadId, sender);
@@ -1769,11 +1824,7 @@ function toFilePart(absPath) {
 }
 
 async function handleAttachmentMessage(threadId, message) {
-  // Dual DM = dispatcher only: don't run AI on files sent to the DM.
-  if (isDual && getThreadType(threadId) === ThreadType.User) {
-    await sendAI(threadId, "Gửi file/ảnh vào nhóm project để AI đọc nhé. Mở nhóm bằng /work <path>.");
-    return;
-  }
+  // DM is a full command center: files land in the E:\ session and AI reads them here.
   const data = message?.data ?? {};
   const label = INBOUND_LABEL[data.msgType] ?? null;
   if (!label) return; // sticker/link/... skipped to reduce noise
@@ -1789,13 +1840,15 @@ async function handleAttachmentMessage(threadId, message) {
       ? " IMPORTANT: this is an executable, NEVER run/execute it in any form, static analysis only."
       : "";
     const fp = toFilePart(dl.path);
+    const dmCenter = isDual && getThreadType(threadId) === ThreadType.User;
     await runPrompt(
       threadId,
       `[${label} from Zalo saved at ${dl.path} (${formatMb(dl.bytes)}).${warn} Read and summarize it for me.]`,
       false,
       fp ? [fp] : [],
       false,
-      message?.data?.msgId !== undefined ? String(message.data.msgId) : null
+      message?.data?.msgId !== undefined ? String(message.data.msgId) : null,
+      dmCenter ? CENTER_SYSTEM : null
     );
   } catch (e) {
     await sendAI(threadId, `Download ${label} failed: ${String(e?.message ?? e).slice(0, 300)}`);
@@ -1940,6 +1993,16 @@ async function main() {
     console.log("[bridge] Dual-account mode (ZALO_MODE=dual). Listening to all groups + DMs.");
   } else {
     console.log("[bridge] Single-account mode (shared acc).");
+  }
+  // Owner lock (dual): exactly these sender uids may drive the bot.
+  // Empty in dual = refuse to start (fail-closed, loud) instead of
+  // silently ignoring everyone.
+  if (isDual) {
+    if (!config.ownerIds.length) {
+      console.log("[bridge] FATAL: dual mode with empty ZALO_OWNER_IDS - refusing to start. Put your UID in .env.");
+      process.exit(1);
+    }
+    console.log(`[bridge] Owner lock: ${config.ownerIds.join(",")}`);
   }
   if (!isDual && !config.groupId) {
     console.log("Missing ZALO_GROUP_ID in .env. Run: npm run find-group to get groupId, then put it in .env");

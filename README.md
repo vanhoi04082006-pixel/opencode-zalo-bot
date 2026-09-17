@@ -37,12 +37,22 @@ Lấy UID chủ: nhắn tin bất kỳ cho bot rồi xem log bridge (`uid=...`),
 
 Xong khi group/DM hiện `bridge ready...`. Không mở `chat.zalo.me` bằng acc đang chạy bridge (đá listener).
 
-## Nhắn riêng cho bot → nhóm project tự động (dual)
+## Nhắn riêng cho bot: trung tâm điều khiển + nhóm project (dual)
 
-- Nhắn DM `/work E:\Projects\X` (hoặc thẳng tên/đường dẫn project, bot tự hiểu) → bot tự tạo (hoặc **dùng lại**, không bao giờ trùng) nhóm `[Bot] X`, gửi header `BotZalo`, từ đó mọi việc diễn ra trong nhóm (session riêng).
-- DM cũng hiểu: chào hỏi, `/groups` (nhóm đang quản lý + mục đích + lần dùng cuối), `/task*` hẹn giờ, `/help`. Câu nào khác thì AI điều phối trả lời ngắn gọn (không làm việc thật trong DM).
-- Zalo **không có API ghim tin nhắn** nên bạn ghim tay header 1 lần.
-- Xóa nhóm tay cũng không sao: `/work` lại sẽ nhận đúng nhóm còn tồn tại theo tên, thiếu mới tạo.
+DM là trung tâm điều khiển cố định ở session `E:\`: **việc nhanh làm trực tiếp tại đây** (đóng/mở app, `/shot`, `/file`, tra cứu, hỏi đáp, gửi ảnh để đọc) — không cần nhóm. **Tạo nhóm chỉ xảy ra khi bạn ra lệnh rõ**, không bao giờ tự ý:
+
+- `/work E:\Projects\X` (đường dẫn đầy đủ) → tạo thẳng nhóm `[Bot] X`.
+- `/projects` → nhắn số chọn project → bot hỏi `1 = tạo nhóm, 3 = thôi` → `1` mới tạo.
+- Nhắn tên project (không path) → bot gợi ý lệnh đúng hoặc list số để chọn (chọn xong vẫn hỏi lại trước khi tạo).
+- Câu chào, `nhóm`, `/groups`, `/help` → trả lời mẫu miễn phí, tức thì. Còn lại AI command-center trò chuyện + làm việc nhanh.
+
+Từ đó việc dài hơi diễn ra trong nhóm (session riêng). Zalo **không có API ghim tin nhắn** nên bạn ghim tay header 1 lần.
+
+Vòng đời nhóm (bot tự xử khi bạn `/work`):
+- Nhóm còn + bạn còn trong nhóm → dùng lại, refresh header.
+- Bạn đã rời nhóm → bot **mời lại** rồi dùng tiếp (mời thất bại thì báo để bạn vào tay).
+- Nhóm bị giải tán (hoặc bot bị đá) → tạo mới + mời; nếu thấy 2 nhóm trùng tên thì xóa tay nhóm cũ.
+- `/groups` hiện trạng thái từng nhóm: `✓` / `[bạn đã rời]` / `[đã giải tán]`.
 
 Header `BotZalo` gồm: Project + branch (`vcs.get`, không phải git thì ẩn), Model (+variant), Context `đã dùng / tổng (%)`, Cost USD, Files thay đổi (+thêm/-bớt), Mục đích.
 
@@ -58,7 +68,7 @@ Header `BotZalo` gồm: Project + branch (`vcs.get`, không phải git thì ẩn
 
 ## An toàn
 
-- Dual: chỉ UID owner mới điều khiển được; xác nhận `yes/1/2/3` gắn đúng người tạo (chống chen ngang); tin lạ bị drop im lặng.
+- Dual: chỉ UID owner mới điều khiển được (khóa đơn chủ, log `Owner lock` lúc boot, trống = từ chối khởi động); xác nhận `yes/1/2/3` gắn đúng người tạo (chống chen ngang); tin lạ bị drop im lặng, mỗi tin chỉ log 1 lần.
 - Chặn lệnh phá hoại ổ hệ thống; lệnh nguy hiểm hỏi `yes/no`; file `.exe/.bat/.ps1` từ Zalo chỉ phân tích tĩnh, không bao giờ chạy.
 - `.zalo-creds*.json` = mật khẩu, không commit (đã ignore). API không chính thức — nên test acc phụ.
 - Một bridge một lúc: `bridge.pid` chặn instance thứ 2 (chặn cứng).
@@ -92,16 +102,17 @@ src/app/run-state.js       # runs/queues/chains/sentCli/srcIds/unsentIds/threadO
 src/zalo-login.js          # login cookie/QR (single + bot riêng)
 src/zalo/send.js           # gửi tin/file/bubble/typing + retry + thread-type
 src/flows/prompt.js        # vòng đời prompt (systemOverride cho AI điều phối)
-src/flows/interaction.js   # pending 1/2/3 + hàng đợi quyền FIFO + pickwork
+src/flows/interaction.js   # pending 1/2/3 + hàng đợi quyền FIFO + pickwork/confirm-work
+src/flows/groups.js        # trạng thái vòng đời nhóm (thuần, có unit test)
 src/flows/status.js        # header BotZalo (branch/model/context/cost/files)
-src/flows/system-prompt.js # system prompt + persona điều phối DM
+src/flows/system-prompt.js # system prompt + persona command-center DM (CENTER_SYSTEM)
 src/tasks.js + tasks/runtime.js # parser + scheduler hẹn giờ
 src/opencode.js            # wrapper SDK v2 (session/vcs/diff/providers/SSE)
 src/config.js / store.js   # cấu hình + persist atomic (sessions/tasks/threadTypes/projectGroups)
 scripts/screenshot.ps1     # chụp màn chính (BLANK khi màn khóa)
 scripts/click.ps1          # click chuột + trả cursor về chỗ cũ
 scripts/restart-bridge.ps1 # restart sạch (chờ chết hẳn)
-scripts/test-perm-queue.mjs# unit test hàng đợi quyền + tombstone (`npm test`)
+scripts/test-perm-queue.mjs# unit test (perm FIFO + tombstone + lifecycle + confirm-work)
 ```
 
 ## Sự cố thường gặp
@@ -111,3 +122,4 @@ scripts/test-perm-queue.mjs# unit test hàng đợi quyền + tombstone (`npm te
 - QR hết hạn: file QR tự tạo lại, quét mã mới nhất.
 - Bridge thứ 2 bị từ chối (`Already running`): dùng `npm run restart` thay vì chạy tay 2 cửa sổ.
 - `/groups` trống sau restart: kiểm tra log boot (`Loaded store: ... projectGroups`) — báo ngay nếu thấy `FALLBACK .bak`.
+- `Non-owner message dropped` lặp lại: bình thường nếu acc lạ spam — mỗi tin chỉ log 1 lần; tin của owner vẫn qua.

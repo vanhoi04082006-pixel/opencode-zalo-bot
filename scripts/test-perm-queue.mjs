@@ -2,6 +2,7 @@
 // Server roundtrips use fake ids -> error paths only, no side effects.
 // Run: node scripts/test-perm-queue.mjs
 import { initInteraction, tryConsumePending, handlePermAsked, peekPermQueue, shiftPermQueue } from "../src/flows/interaction.js";
+import { classifyGroupState, projectKey } from "../src/flows/groups.js";
 import { flushQueue } from "../src/flows/prompt.js";
 import { markUnsent, isUnsent, queues } from "../src/app/run-state.js";
 
@@ -58,6 +59,33 @@ ok(isUnsent("m1") && !isUnsent("other"), "tombstone lookup");
 flushQueue("t9");
 await new Promise((r) => setTimeout(r, 500));
 ok((queues.t9 ?? []).length === 0, "tombstoned queue item dropped");
+
+// Group lifecycle matrix (pure, no I/O).
+const G = "gid-1";
+const OWNER = "2165294254675704022";
+ok(projectKey("E:\\Projects\\X") === "e:\\projects\\x", "projectKey lowercases");
+ok(classifyGroupState({ [G]: { memVerList: [`${OWNER}_0`, "645620599654111023_3"] } }, G, OWNER) === "ok", "matrix: ok");
+ok(classifyGroupState({ [G]: { memVerList: ["645620599654111023_3"] } }, G, OWNER) === "owner-left", "matrix: owner-left");
+ok(classifyGroupState({}, G, OWNER) === "gone", "matrix: gone (disbanded)");
+ok(classifyGroupState(null, G, OWNER) === "gone", "matrix: gone (null map)");
+ok(classifyGroupState({ [G]: { memVerList: [] } }, G, null) === "ok", "matrix: unknown requester keeps group");
+
+// confirm-work: pick from /projects then 1 = create via startWork action.
+let started = null;
+initInteraction({
+  getStore: () => store,
+  getClient: () => fakeClient,
+  actions: { startWork: async (tid, dir, purpose) => { started = { tid, dir, purpose }; } },
+});
+store.pending.dm1 = { kind: "confirm-work", dir: "E:\\Projects\\X", purpose: "E:\\Projects\\X", ts: Date.now(), by: null };
+await tryConsumePending("dm1", "1", false, "owner1");
+await new Promise((r) => setTimeout(r, 300));
+ok(started?.dir === "E:\\Projects\\X", "confirm-work 1 calls startWork");
+ok(!store.pending.dm1, "confirm-work pending cleared");
+store.pending.dm2 = { kind: "confirm-work", dir: "E:\\Projects\\Y", purpose: "Y", ts: Date.now(), by: null };
+await tryConsumePending("dm2", "3", false, "owner1");
+await new Promise((r) => setTimeout(r, 300));
+ok(!store.pending.dm2 && started?.dir === "E:\\Projects\\X", "confirm-work 3 cancels, no create");
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

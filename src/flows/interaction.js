@@ -8,9 +8,10 @@ import {
   replyQuestion,
   groupDir,
 } from "../opencode.js";
+import { ThreadType } from "zca-js";
 import { config, isDualAccount, isOwner } from "../config.js";
 import { queues, getThreadOwner } from "../app/run-state.js";
-import { sendAI, sendFiles, fileLabel } from "../zalo/send.js";
+import { sendAI, sendFiles, fileLabel, getThreadType } from "../zalo/send.js";
 import { runPrompt } from "./prompt.js";
 import { detectYesNo } from "../intent.js";
 import { aliveDir } from "../files.js";
@@ -325,7 +326,34 @@ if (!isCmd && pm) {
     return true;
   }
   const pick = store.pending[threadId];
-  // DM dispatcher: pick project dir to open a work group
+  const isDMThread = isDualAccount() && getThreadType(threadId) === ThreadType.User;
+  // Confirm group creation (never auto-create): 1 = create, 3 = cancel.
+  if (!isCmd && pick?.kind === "confirm-work") {
+    if (Date.now() - (pick.ts ?? 0) > 300000) {
+      delete store.pending[threadId];
+      saveStore(store);
+      await sendAI(threadId, "Selection expired.");
+      return true;
+    }
+    const yn = detectYesNo(t);
+    if (yn === "no" || t.trim() === "3") {
+      delete store.pending[threadId];
+      saveStore(store);
+      await sendAI(threadId, "Thôi, không tạo nhóm.");
+      return true;
+    }
+    if (yn === "yes" || t.trim() === "1") {
+      const dir = pick.dir;
+      const purpose = pick.purpose ?? dir;
+      delete store.pending[threadId];
+      saveStore(store);
+      await act.startWork(threadId, dir, purpose);
+      return true;
+    }
+    await sendAI(threadId, `Mở nhóm làm việc ở ${pick.dir}? 1 = tạo, 3 = thôi.`);
+    return true;
+  }
+  // Bare-name project pick: choose number first, then confirm-work asks.
   if (!isCmd && pick?.kind === "pickwork" && /^\d{1,2}$/.test(t)) {
     if (Date.now() - (pick.ts ?? 0) > 300000) {
       delete store.pending[threadId];
@@ -338,14 +366,13 @@ if (!isCmd && pm) {
       await sendAI(threadId, `Pick a number 1-${(pick.candidates ?? []).length}.`);
       return true;
     }
-    const purpose = pick.purpose ?? dir;
-    delete store.pending[threadId];
+    store.pending[threadId] = { kind: "confirm-work", dir, purpose: pick.purpose ?? dir, ts: Date.now(), by: getThreadOwner(threadId) };
     saveStore(store);
-    await act.startWork(threadId, dir, purpose);
+    await sendAI(threadId, `Mở nhóm làm việc ở ${dir}?\n1 = tạo nhóm, 3 = thôi.`);
     return true;
   }
   // Cancel picking (pickproject/picksession/...): reply no/cancel
-  if (pick && ["pickproject", "picksession", "pickfile", "pickmodel", "pickvariant", "pickmessage", "pickcommand", "pickskill", "pickqueue", "pickwork"].includes(pick.kind) && detectYesNo(t) === "no") {
+  if (pick && ["pickproject", "picksession", "pickfile", "pickmodel", "pickvariant", "pickmessage", "pickcommand", "pickskill", "pickqueue", "pickwork", "confirm-work"].includes(pick.kind) && detectYesNo(t) === "no") {
     delete store.pending[threadId];
     saveStore(store);
     await sendAI(threadId, "Selection cancelled.");
@@ -401,6 +428,14 @@ if (!isCmd && pm) {
         return true;
       }
       if (pick.kind === "pickproject") {
+        // DM: picking a project offers group creation (never silent switch).
+        // Groups: legacy behavior (switch dir in place).
+        if (isDMThread) {
+          store.pending[threadId] = { kind: "confirm-work", dir: chosen, purpose: chosen, ts: Date.now(), by: getThreadOwner(threadId) };
+          saveStore(store);
+          await sendAI(threadId, `Mở nhóm làm việc ở ${chosen}?\n1 = tạo nhóm, 3 = thôi. (Dir hiện tại của chat này không đổi.)`);
+          return true;
+        }
         delete store.pending[threadId];
         saveStore(store);
         await act.doSwitchDir(threadId, chosen);
