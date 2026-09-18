@@ -22,23 +22,48 @@ import {
   sensitivity,
 } from "../files.js";
 import { runs, queues, chainGroup, clearRunTimers, getThreadOwner, isUnsent } from "../app/run-state.js";
-import { sendAI, sendFiles, fileLabel } from "../zalo/send.js";
+import { sendAI, sendFiles, sendStickerNow, fileLabel } from "../zalo/send.js";
 import { ZALO_SYSTEM, buildAnchor } from "./system-prompt.js";
+import { parseStickerTag, resolveSticker, say } from "./persona.js";
 
 // bridge.js injects live singletons once (avoids circular import).
 let _getClient = () => null;
 let _getStore = () => null;
 let _getProg = () => null;
+let _getApi = () => null;
 
-export function initPrompt({ getClient, getStore, getProg }) {
+export function initPrompt({ getClient, getStore, getProg, getApi }) {
   if (getClient) _getClient = getClient;
   if (getStore) _getStore = getStore;
   if (getProg) _getProg = getProg;
+  if (getApi) _getApi = getApi;
 }
 
 const getClient = () => _getClient();
 const getStore = () => _getStore();
 const getProg = () => _getProg();
+const getApi = () => {
+  try {
+    return _getApi();
+  } catch {
+    return null;
+  }
+};
+
+// Sticker delivery: trailing [sticker:kw] tag in AI text becomes a real
+// Zalo sticker AFTER the text lands. Max 1 per reply, AI text only.
+async function deliverSticker(threadId, keyword) {
+  if (!keyword) return;
+  try {
+    const store = getStore();
+    const found = await resolveSticker(getApi(), store, keyword);
+    if (!found) return;
+    try {
+      saveStore(store);
+    } catch {}
+    await sendStickerNow(threadId, found);
+  } catch {}
+}
 
 // Find the group owning a session
 export function groupOfSession(sid) {
@@ -94,7 +119,7 @@ export function gateSensitiveFile(threadId, absPaths) {
   store.pending[threadId] = { kind: "sensitive-file", paths: absPaths, ts: Date.now(), by: getThreadOwner(threadId) };
   saveStore(store);
   const names = needAsk.slice(0, 3).map((p) => fileLabel(p)).join(", ");
-  sendAI(threadId, `Sensitive file(s) (${names}). Reply: 1 = allow once, 2 = always (this session), 3 = deny.`).catch(() => {});
+  sendAI(threadId, say.sensitiveAsk(names)).catch(() => {});
   return "ask";
 }
 
@@ -300,8 +325,11 @@ export async function deliverRun(threadId, sid) {
     saveStore(store);
     if (freshTexts.length) {
       const tag = run.tag ? `[${run.tag}] ` : "";
-      const reply = freshTexts.join("\n").trim() || "(opencode returned no text)";
-      await sendAI(threadId, tag + reply);
+      const rawReply = freshTexts.join("\n").trim() || "(opencode returned no text)";
+      const { text: reply, keyword } = parseStickerTag(rawReply);
+      const outText = reply || (keyword ? "" : "(opencode returned no text)");
+      if (outText) await sendAI(threadId, tag + outText);
+      await deliverSticker(threadId, keyword);
       await autoAttachReply(threadId, reply);
       if (run.fresh) await autoTitle(threadId, sid, run.firstText);
     }
@@ -347,12 +375,12 @@ export async function autoAttachReply(threadId, reply) {
         const store = getStore();
         store.pending[threadId] = { kind: "sensitive-file", paths: sendable, ts: Date.now(), by: getThreadOwner(threadId) };
         saveStore(store);
-        await sendAI(threadId, `Screenshot ready (${shots.map((p) => fileLabel(p)).join(", ")}). Reply: 1 = send, 2 = always this session, 3 = cancel.`);
+        await sendAI(threadId, say.shotAsk(shots.map((p) => fileLabel(p)).join(", ")));
         return;
       }
       const gate = gateSensitiveFile(threadId, sendable);
       if (gate === "deny") {
-        await sendAI(threadId, "Forbidden file (system/registry). Cannot send.");
+        await sendAI(threadId, say.attachDeny());
         return;
       }
       if (gate === "ok") await sendFiles(threadId, null, sendable);
@@ -363,9 +391,9 @@ export async function autoAttachReply(threadId, reply) {
       const s0 = suspects[0];
       if (isOutsideScope(s0)) {
         const roots = [config.workdir, ...(config.extraRoots ?? [])].join(", ");
-        await sendAI(threadId, `Forbidden path (allowed: ${roots}): ${s0.slice(0, 150)}`);
+        await sendAI(threadId, say.outsideScope(roots, s0.slice(0, 150)));
       } else {
-        await sendAI(threadId, `Found path-like text but it does not exist: ${s0}`);
+        await sendAI(threadId, say.pathLike(s0));
       }
     }
   } catch (e) {

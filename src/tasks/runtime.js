@@ -3,6 +3,7 @@ import { parseCron, nextCronRun } from "../tasks.js";
 import { getSession, sendPromptAsync } from "../opencode.js";
 import { runs } from "../app/run-state.js";
 import { sendAI } from "../zalo/send.js";
+import { say } from "../flows/persona.js";
 import { ZALO_SYSTEM } from "../flows/system-prompt.js";
 
 // Task hen gio (cron chuan + tieng Viet don gian).
@@ -102,7 +103,7 @@ export async function fireTask(id) {
   } catch (e) {
     delete runs[task.sessionID];
     await prog.stop(task.sessionID, true).catch(() => {});
-    await sendAI(groupId, `[Task ${task.name}] Loi chay: ${(e?.message ?? e).slice(0, 200)}`);
+    await sendAI(groupId, say.taskRunFailed(task.name, String(e?.message ?? e).slice(0, 200)));
   } finally {
     if (task.kind === "once") {
       removeTask(id, true);
@@ -116,7 +117,7 @@ export function loadTasksOnBoot() {
   for (const task of [...getTasks()]) {
     if (task.kind === "once" && (task.runAt ?? 0) <= Date.now()) {
       removeTask(task.id, true);
-      sendAI(task.groupId, `Task '${task.name}' expired (bridge was off), dropped.`).catch(() => {});
+      sendAI(task.groupId, say.taskExpiredDropped(task.name)).catch(() => {});
       continue;
     }
     scheduleTask(task);

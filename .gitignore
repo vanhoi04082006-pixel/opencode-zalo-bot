@@ -7,6 +7,9 @@ node_modules/
 zalo-qr.png
 zalo-qr-bot.png
 bridge.pid
+# Personal persona pack (local flavor overrides). Copy from
+# src/flows/persona.local.example.js - never commit the real one.
+src/flows/persona.local.js
 .env
 *.log
 .serve.pid

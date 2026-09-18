@@ -8,7 +8,7 @@
     "find-group": "node src/find-group.js",
     "find-group:bot": "node src/find-group.js --bot",
     "serve": "opencode serve --port 4096 --hostname 127.0.0.1",
-    "test": "node scripts/test-perm-queue.mjs",
+    "test": "node scripts/test-imports.mjs && node scripts/test-perm-queue.mjs && node scripts/test-persona.mjs",
     "restart": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/restart-bridge.ps1"
   },
   "dependencies": {

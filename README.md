@@ -73,6 +73,14 @@ Header `BotZalo` gồm: Project + branch (`vcs.get`, không phải git thì ẩn
 - `.zalo-creds*.json` = mật khẩu, không commit (đã ignore). API không chính thức — nên test acc phụ.
 - Một bridge một lúc: `bridge.pid` chặn instance thứ 2 (chặn cứng).
 
+## Persona (giọng bot + sticker)
+
+- Mọi tin hệ thống (quyền 1/2/3, hỏi đáp, shutdown, pick số, task...) đi qua `say.*` trong `src/flows/persona.js` — số/path/lệnh/`yes-no` giữ nguyên để parser không vỡ. Giọng AI đi qua `VOICE` trong cùng file.
+- Mặc định repo dùng pack neutral. Muốn giọng riêng: copy `src/flows/persona.local.example.js` thành `src/flows/persona.local.js` (**đã git-ignore, không bao giờ commit**) rồi sửa chuỗi, restart bridge là nhận. File local thiếu key nào thì rớt về neutral key đó.
+- **Emoji**: text unicode, luôn gửi được.
+- **Sticker Zalo native**: AI chèn tag `[sticker:<từ>]` cuối câu khi voice cho phép; bridge cắt tag, tra kho sticker (`searchSticker` + cache 30 ngày trong store), gửi sticker thật sau tin nhắn. Tối đa 1 sticker/reply, chỉ text AI. Từ lạ → bỏ qua im lặng. Pack neutral không dạy AI dùng tag nên pipeline nằm im.
+- **Gif**: bot không tự gửi (không có kho gif nguồn); bạn gửi gif/file vào thì AI vẫn đọc như ảnh. Không upload sticker custom được (Zalo không có API) — workaround là gửi `.png/.webp` như ảnh thường.
+
 ## Tiến trình và typing
 
 - Mỗi run gửi ngay 1 tin `⏳ Working...` (giữ luôn như lịch sử terminal), cập nhật theo tool/todo, tối đa 15 lần.
@@ -104,6 +112,8 @@ src/zalo/send.js           # gửi tin/file/bubble/typing + retry + thread-type
 src/flows/prompt.js        # vòng đời prompt (systemOverride cho AI điều phối)
 src/flows/interaction.js   # pending 1/2/3 + hàng đợi quyền FIFO + pickwork/confirm-work
 src/flows/groups.js        # trạng thái vòng đời nhóm (thuần, có unit test)
+src/flows/persona.js       # persona pack: neutral mặc định + local-override + sticker vocab/resolve
+src/flows/persona.local.example.js # mẫu pack cá nhân (copy thành persona.local.js, đã ignore)
 src/flows/status.js        # header BotZalo (branch/model/context/cost/files)
 src/flows/system-prompt.js # system prompt + persona command-center DM (CENTER_SYSTEM)
 src/tasks.js + tasks/runtime.js # parser + scheduler hẹn giờ
@@ -113,6 +123,7 @@ scripts/screenshot.ps1     # chụp màn chính (BLANK khi màn khóa)
 scripts/click.ps1          # click chuột + trả cursor về chỗ cũ
 scripts/restart-bridge.ps1 # restart sạch (chờ chết hẳn)
 scripts/test-perm-queue.mjs# unit test (perm FIFO + tombstone + lifecycle + confirm-work)
+scripts/test-persona.mjs   # unit test persona (wrap/tag/resolver) + test-imports.mjs (chống crash import)
 ```
 
 ## Sự cố thường gặp

@@ -42,6 +42,7 @@ import {
 import { detectShutdownIntent, detectDirIntent } from "./intent.js";
 import { buildStatusHeader } from "./flows/status.js";
 import { CENTER_SYSTEM } from "./flows/system-prompt.js";
+import { parseStickerTag, say } from "./flows/persona.js";
 import { execFile, spawn } from "node:child_process";
 import { listTopDirs, buildIndex, searchFiles, norm } from "./filefind.js";
 import { parseSchedule, describeTask, fmtTime } from "./tasks.js";
@@ -132,7 +133,7 @@ const prog = createProgress({
   },
   getIsDual: () => isDual,
 });
-initPrompt({ getClient: () => client, getStore: () => store, getProg: () => prog });
+initPrompt({ getClient: () => client, getStore: () => store, getProg: () => prog, getApi: () => api });
 initInteraction({
   getStore: () => store,
   getClient: () => client,
@@ -149,13 +150,13 @@ initInteraction({
 
 // Stop/restart serve after natural yes-confirm (pending confirm-serve)
 async function serveConfirm(threadId, action) {
-  await sendAI(threadId, `Serve ${action} in progress...`);
+  await sendAI(threadId, say.serveWorking(action));
   const stopped = await stopServe();
   if (action === "restart") {
     const ok = await ensureServe(true);
-    await sendAI(threadId, ok ? "Serve da restart xong." : "Restart that bai. Mo tay: opencode serve --port 4096.");
+    await sendAI(threadId, say.serveRestarted(ok));
   } else {
-    await sendAI(threadId, stopped ? "Serve stopped. Restart: /opencode_start" : "Cannot stop (serve may be unmanaged). Close its window manually.");
+    await sendAI(threadId, say.serveStopped(stopped));
   }
 }
 
@@ -391,10 +392,10 @@ function startWatchdog(groupId) {
       const target = groupId ?? notifyTarget();
       if (!up && !serveWasDown) {
         serveWasDown = true;
-        if (target) await sendAI(target, "opencode serve is down. Restarting...").catch(() => {});
+        if (target) await sendAI(target, say.serveDown()).catch(() => {});
         const ok = await ensureServe();
         serveWasDown = !ok;
-        if (target) await sendAI(target, ok ? "Serve is back." : "Auto-restart failed. Manually run: opencode serve --port 4096.").catch(() => {});
+        if (target) await sendAI(target, ok ? say.serveBack() : say.serveBackFailed()).catch(() => {});
       } else if (up && serveWasDown) {
         serveWasDown = false;
       }
@@ -487,10 +488,10 @@ async function handleGroupText(threadId, text, msgId, uid, cliMsgId) {
     if (!sid) {
       delete queues[threadId];
       saveStore(store);
-      await sendAI(threadId, "No session is running.");
+      await sendAI(threadId, say.abortNoSession());
       return;
     }
-    await sendAI(threadId, "Stopping...");
+    await sendAI(threadId, say.abortStopping());
     if (runs[sid]) runs[sid].userAborted = true;
     delete queues[threadId];
     delete store.pending[threadId];
@@ -508,18 +509,18 @@ async function handleGroupText(threadId, text, msgId, uid, cliMsgId) {
     await prog.stop(sid, true);
     delete runs[sid];
     if (st === "idle" || st === "not-found") {
-      await sendAI(threadId, "Stopped.");
+      await sendAI(threadId, say.abortStopped());
     } else if (!aborted) {
-      await sendAI(threadId, "Abort did not arrive (timeout). Try /abort again or /new.");
+      await sendAI(threadId, say.abortTimeout());
     } else {
-      await sendAI(threadId, "Still busy. Try /abort again or /new for a fresh session.");
+      await sendAI(threadId, say.abortBusy());
     }
     return;
   }
   if (t === "/ok") {
     const p = store.pending[threadId];
     if (!p) {
-      await sendAI(threadId, "Nothing pending approval.");
+      await sendAI(threadId, say.okNothing());
       return;
     }
     // Dual: only the pending creator may approve (anti-hijack, same rule as tryConsumePending).
@@ -553,13 +554,13 @@ async function handleGroupText(threadId, text, msgId, uid, cliMsgId) {
     const err = await new Promise((resolve) => {
       execFile("shutdown.exe", ["/a"], (e) => resolve(e ? e.message : null));
     });
-    await sendAI(threadId, err ? `No scheduled power action to cancel (${err.slice(0, 120)})` : "Power action cancelled.");
+    await sendAI(threadId, err ? say.powerNone(err.slice(0, 120)) : say.powerCancelled());
     return;
   }
 
   if (t === "/opencode_start") {
     const ok = await ensureServe(true);
-    await sendAI(threadId, ok ? "opencode serve is running." : "Cannot start serve. Manually run: opencode serve --port 4096.");
+    await sendAI(threadId, say.serveRunning(ok));
     return;
   }
   if (t === "/opencode_stop" || t === "/opencode_restart") {
@@ -856,7 +857,7 @@ async function handleGroupText(threadId, text, msgId, uid, cliMsgId) {
       delete store.pending[threadId];
       saveStore(store);
       if (!chosen) {
-        await sendAI(threadId, "Invalid number.");
+        await sendAI(threadId, say.pickInvalid());
         return;
       }
       await fireCommand(threadId, chosen, "");
@@ -892,7 +893,7 @@ async function handleGroupText(threadId, text, msgId, uid, cliMsgId) {
       delete store.pending[threadId];
       saveStore(store);
       if (!chosen) {
-        await sendAI(threadId, "Invalid number.");
+        await sendAI(threadId, say.pickInvalid());
         return;
       }
       await fireCommand(threadId, chosen, "");
@@ -967,7 +968,7 @@ async function handleGroupText(threadId, text, msgId, uid, cliMsgId) {
     }
     const mid = (p.candidates ?? [])[Number(num) - 1];
     if (!mid) {
-      await sendAI(threadId, "Invalid number.");
+      await sendAI(threadId, say.pickInvalid());
       return;
     }
     const sid = store.sessions[threadId];
@@ -1020,7 +1021,7 @@ async function handleGroupText(threadId, text, msgId, uid, cliMsgId) {
       }
       const mid = (p.candidates ?? [])[Number(arg) - 1];
       if (!mid) {
-        await sendAI(threadId, "Invalid number.");
+        await sendAI(threadId, say.pickInvalid());
         return;
       }
       const sid = store.sessions[threadId];
@@ -1073,23 +1074,23 @@ async function handleGroupText(threadId, text, msgId, uid, cliMsgId) {
       const n = Number(del[2]);
       const removed = q[n - 1];
       if (!removed) {
-        await sendAI(threadId, "Invalid number.");
+        await sendAI(threadId, say.pickInvalid());
         return;
       }
       q.splice(n - 1, 1);
-      await sendAI(threadId, `Deleted queue item ${n}${removed.text ? `: "${removed.text.slice(0, 60)}"` : ""}.`);
+      await sendAI(threadId, say.queueDeleted(n, removed.text ? `: "${removed.text.slice(0, 60)}"` : ""));
       return;
     }
     if (!q.length) {
       const sid = store.sessions[threadId];
-      await sendAI(threadId, runs[sid]?.busy ? "Working on 1 task, queue empty." : "Nothing running, queue empty.");
+      await sendAI(threadId, say.queueEmpty(!!runs[sid]?.busy));
       return;
     }
     store.pending[threadId] = { kind: "pickqueue", candidates: q.map((_, i) => i), ts: Date.now(), by: getThreadOwner(threadId) };
     saveStore(store);
     await sendAI(
       threadId,
-      `Hang doi (${q.length}):\n${q.map((item, i) => `${i + 1}. ${(item.text ?? `/${item.command ?? ""}`).slice(0, 80)}`).join("\n")}\nNhan so de huy muc do, hoac /queue huy <so>.`
+      say.queueList(q.map((item, i) => `${i + 1}. ${(item.text ?? `/${item.command ?? ""}`).slice(0, 80)}`).join("\n"))
     );
     return;
   }
@@ -1099,12 +1100,12 @@ async function handleGroupText(threadId, text, msgId, uid, cliMsgId) {
     // Single: one thread anyway, behavior unchanged.
     const items = isDual ? getTasks().filter((x) => String(x.groupId) === String(threadId)) : getTasks();
     if (!items.length) {
-      await sendAI(threadId, "No scheduled tasks. Create: /task <schedule> | <job> (ex /task in 30m | drink water reminder).");
+      await sendAI(threadId, say.taskNone());
       return;
     }
     await sendAI(
       threadId,
-      `Tasks (${items.length}/10):\n${items.map((x, i) => `${i + 1}. ${describeTask(x)}`).join("\n")}\n/taskdel <so> de xoa.`
+      say.taskList(items.map((x, i) => `${i + 1}. ${describeTask(x)}`).join("\n"), items.length)
     );
     return;
   }
@@ -1114,11 +1115,11 @@ async function handleGroupText(threadId, text, msgId, uid, cliMsgId) {
     const items = isDual ? getTasks().filter((x) => String(x.groupId) === String(threadId)) : getTasks();
     const item = items[Number(taskdel[1]) - 1];
     if (!item) {
-      await sendAI(threadId, "Invalid number. Send /tasklist.");
+      await sendAI(threadId, say.taskInvalid());
       return;
     }
     removeTask(item.id, true);
-    await sendAI(threadId, `Deleted task '${item.name}'.`);
+    await sendAI(threadId, say.taskDeleted(item.name));
     return;
   }
 
@@ -1126,17 +1127,17 @@ async function handleGroupText(threadId, text, msgId, uid, cliMsgId) {
     const rest = t.replace(/^\/task\s*/, "").trim();
     const sep = rest.indexOf("|");
     if (sep < 0) {
-      await sendAI(threadId, "Usage: /task <schedule> | <job>. Schedule: cron (0 8 * * *) | in 30m | every day 8 | tomorrow 8.");
+      await sendAI(threadId, say.taskUsage());
       return;
     }
     const schedRaw = rest.slice(0, sep).trim();
     const text = rest.slice(sep + 1).trim();
     if (!text) {
-      await sendAI(threadId, "Missing job text after |.");
+      await sendAI(threadId, say.taskMissingJob());
       return;
     }
     if (getTasks().length >= 10) {
-      await sendAI(threadId, "Max 10 tasks. Delete with /taskdel.");
+      await sendAI(threadId, say.taskMax());
       return;
     }
     const parsed = parseSchedule(schedRaw);
@@ -1165,10 +1166,10 @@ async function handleGroupText(threadId, text, msgId, uid, cliMsgId) {
     scheduleTask(task);
     const again = getTasks().find((x) => x.id === task.id);
     if (task.kind === "once" && !again) {
-      await sendAI(threadId, "Time passed, not scheduled.");
+      await sendAI(threadId, say.taskTimePassed());
       return;
     }
-    await sendAI(threadId, `Scheduled: ${describeTask(again ?? task)}. PC off = tasks don't run.`);
+    await sendAI(threadId, say.taskScheduled(describeTask(again ?? task)));
     return;
   }
 
@@ -1260,7 +1261,7 @@ async function handleGroupText(threadId, text, msgId, uid, cliMsgId) {
     const real = chk.path ?? shotPath;
     store.pending[threadId] = { kind: "sensitive-file", paths: [real], ts: Date.now(), by: getThreadOwner(threadId) };
     saveStore(store);
-    await sendAI(threadId, `Screenshot ready (${fileLabel(real)}). Reply: 1 = send, 3 = cancel.`);
+    await sendAI(threadId, say.shotAsk(fileLabel(real)));
     return;
   }
 
@@ -1292,7 +1293,7 @@ async function handleGroupText(threadId, text, msgId, uid, cliMsgId) {
 
   // Hard block: drive format, Windows system delete (no approval path)
   if (/format\s+[a-z]:/i.test(t) || /(del|rmdir|rd|remove-item)[\s\S]{0,60}c:\\windows/i.test(t)) {
-    await sendAI(threadId, "Hard-blocked (system destruction). Cannot run.");
+    await sendAI(threadId, say.hardBlocked());
     return;
   }
 
@@ -1301,7 +1302,7 @@ async function handleGroupText(threadId, text, msgId, uid, cliMsgId) {
   if (danger && !store.pending[threadId]) {
     store.pending[threadId] = { kind: "text", text: t, ts: Date.now(), by: getThreadOwner(threadId) };
     saveStore(store);
-    await sendAI(threadId, `Dangerous: ${danger} Reply yes to run, no to cancel.`);
+    await sendAI(threadId, say.dangerAsk(danger));
     return;
   }
 
@@ -1322,13 +1323,13 @@ async function doWorkCommand(threadId, raw) {
   const cands = r.candidates.slice(0, 8);
   store.pending[threadId] = { kind: "pickwork", candidates: cands, purpose: raw, ts: Date.now(), by: getThreadOwner(threadId) };
   saveStore(store);
-  await sendAI(threadId, `Nhiều project trùng tên:\n${cands.map((d, i) => `${i + 1}. ${d}`).join("\n")}\nNhắn số để mở nhóm.`);
+  await sendAI(threadId, say.pickWorkMany(cands.map((d, i) => `${i + 1}. ${d}`).join("\n")));
 }
 
 async function doGroupsCommand(threadId) {
   const entries = Object.entries(store.projectGroups ?? {});
   if (!entries.length) {
-    await sendAI(threadId, "Chưa có nhóm project nào. DM: /work <path> để mở.");
+    await sendAI(threadId, say.groupsEmpty());
     return;
   }
   // Verify liveness in one batched call (report only - fixes happen in /work).
@@ -1350,9 +1351,11 @@ async function doGroupsCommand(threadId) {
   const stateNote = (s) => (s === "ok" ? "" : s === "owner-left" ? " [bạn đã rời - /work để mời lại]" : s === "gone" ? " [đã giải tán - /work để tạo lại]" : "");
   await sendAI(
     threadId,
-    `Nhóm project (${entries.length}):\n${entries
-      .map(([k, pg], i) => `${i + 1}. ${pg.name ?? k}${pg.purpose ? ` — ${pg.purpose}` : ""} (dùng cuối ${fmtTs(pg.lastUsed)})${stateNote(states[pg.groupId])}`)
-      .join("\n")}\nDM /work <path> để mở/tiếp tục.`
+    say.groupsList(
+      entries
+        .map(([k, pg], i) => `${i + 1}. ${pg.name ?? k}${pg.purpose ? ` — ${pg.purpose}` : ""} (dùng cuối ${fmtTs(pg.lastUsed)})${stateNote(states[pg.groupId])}`)
+        .join("\n")
+    )
   );
 }
 
@@ -1369,17 +1372,11 @@ function isDMGreeting(t) {
 async function handleDMsoft(threadId, t) {
   const nn = norm(t);
   if (isDMGreeting(t)) {
-    await sendAI(
-      threadId,
-      `Chào bạn! Mình là trung tâm điều khiển máy này (scope E:\\).\n- Việc nhanh (đóng app, tra cứu, hỏi đáp): nhắn thẳng ở đây, mình làm luôn.\n- Việc project dài hơi: /work <đường dẫn đầy đủ> để mở nhóm, hoặc /projects rồi chọn số.\n- Xem nhóm đang có: /groups.`
-    );
+    await sendAI(threadId, say.greeting());
     return true;
   }
   if (/\b(help|giup|tro giup|huong dan|lenh|danh sach lenh|em lam duoc gi|giup duoc gi)\b/.test(nn)) {
-    await sendAI(
-      threadId,
-      "DM điều phối:\n/work <path đủ> - Mở nhóm project mới\n/projects - Chọn project từ danh sách rồi mở nhóm\n/groups - Nhóm project đang quản lý\n/task in 30m | <việc> - Hẹn giờ\n/status /sessions /dir /ls /file /shot - Dùng trực tiếp ở đây\nViệc nhanh mình làm luôn tại đây; việc dài thì mở nhóm nhé."
-    );
+    await sendAI(threadId, say.dmHelp());
     return true;
   }
   if (/\b(nhom|nhom nao|group|ds nhom|danh sach)\b/.test(nn) && !/\b(tao|mo|them|work)\b/.test(nn)) {
@@ -1402,7 +1399,7 @@ async function handleDMsoft(threadId, t) {
         return norm(base) === q || norm(String(p.name ?? "")) === q;
       });
       if (matches.length === 1) {
-        await sendAI(threadId, `Ý bạn là project ${matches[0].worktree}? Nhắn /work ${matches[0].worktree} để mở nhóm, hoặc /projects để chọn từ danh sách.`);
+        await sendAI(threadId, say.suggestWork(matches[0].worktree));
         return true;
       }
       if (matches.length > 1) {
@@ -1487,7 +1484,7 @@ async function startWork(dmThreadId, dir, purpose) {
         reused = true;
         reinvited = true;
       } catch (e) {
-        await sendAI(dmThreadId, `Bạn đã rời nhóm ${name} mà mình mời lại không được (${String(e?.message ?? e).slice(0, 150)}). Bạn vào tay nhóm rồi nhắn /work lại nhé.`);
+        await sendAI(dmThreadId, say.groupLeftReinviteFailed(name, String(e?.message ?? e).slice(0, 150)));
         return;
       }
     } else {
@@ -1520,7 +1517,7 @@ async function startWork(dmThreadId, dir, purpose) {
     }
   }
   if (!groupId) {
-    await sendAI(dmThreadId, `Creating group ${name}...`);
+    await sendAI(dmThreadId, say.groupCreating(name));
     try {
       const res = await api.createGroup({ name, members: requester ? [requester] : [] });
       if (!res?.groupId) {
@@ -1528,7 +1525,7 @@ async function startWork(dmThreadId, dir, purpose) {
       }
       groupId = res.groupId;
     } catch (e) {
-      await sendAI(dmThreadId, `Tạo nhóm thất bại: ${String(e?.message ?? e).slice(0, 200)}. Bạn tạo tay nhóm 2 người (bạn + bot) rồi nhắn /work lại. Nếu thấy 2 nhóm trùng tên thì xóa tay nhóm cũ giúp.`);
+      await sendAI(dmThreadId, say.groupCreateFailed(String(e?.message ?? e).slice(0, 200)));
       return;
     }
   }
@@ -1558,11 +1555,7 @@ async function startWork(dmThreadId, dir, purpose) {
   await sendAI(groupId, `${header}\n📌 Bạn ghim tay tin này giúp nhé (Zalo không cho bot tự ghim).`);
   await sendAI(
     dmThreadId,
-    reinvited
-      ? `Bạn đã rời nhóm ${name}, mình đã mời lại. Vào nhóm làm tiếp nhé.`
-      : reused
-        ? `Nhóm ${name} vẫn còn, header mới đã gửi vào nhóm. Vào đó làm tiếp nhé.`
-        : `Tạo nhóm ${name} xong. Vào đó chat tiếp nhé — mọi việc làm ở đó.`
+    reinvited ? say.groupReinvited(name) : reused ? say.groupReused(name) : say.groupCreated(name)
   );
 }
 
@@ -1654,7 +1647,8 @@ async function bgNotify(sid, ev) {
       if (!text) return;
       markDelivered(store, sid, mid);
       saveStore(store);
-      await sendAI(groupId, `📌 Session ${label} has new results: ${text.slice(0, 300)} (/sessions to view)`);
+      const { text: cleanText } = parseStickerTag(text); // never leak [sticker:*] tags
+      await sendAI(groupId, `📌 Session ${label} has new results: ${cleanText.slice(0, 300)} (/sessions to view)`);
       return;
     }
     if (ev.type === "question.asked") {
@@ -1830,10 +1824,10 @@ async function handleAttachmentMessage(threadId, message) {
   if (!label) return; // sticker/link/... skipped to reduce noise
   const att = extractAttachment(data.content);
   if (!att) {
-    await sendAI(threadId, `Got ${label} but no download link.`);
+    await sendAI(threadId, say.attachNoLink(label));
     return;
   }
-  await sendAI(threadId, `Downloading ${label}...`);
+  await sendAI(threadId, say.downloading(label));
   try {
     const dl = await downloadToInbox(att.href, att.name, getCookieHeader(isDual ? config.botCredsPath : config.credsPath));
     const warn = isExecFile(dl.path)
@@ -1851,7 +1845,7 @@ async function handleAttachmentMessage(threadId, message) {
       dmCenter ? CENTER_SYSTEM : null
     );
   } catch (e) {
-    await sendAI(threadId, `Download ${label} failed: ${String(e?.message ?? e).slice(0, 300)}`);
+    await sendAI(threadId, say.downloadFailed(label, String(e?.message ?? e).slice(0, 300)));
   }
 }
 
@@ -1899,7 +1893,7 @@ async function onUndo(undo) {
       if (idx >= 0) {
         const [rm] = q.splice(idx, 1);
         const preview = rm.text ? `: "${rm.text.slice(0, 60)}"` : "";
-        await sendAI(gid, `Cancelled queued request${preview}.`);
+        await sendAI(gid, say.unsendCancelledQueue(preview));
         return;
       }
     }
@@ -1911,7 +1905,7 @@ async function onUndo(undo) {
         clearRunTimers(sid);
         await prog.stop(sid, true);
         delete runs[sid];
-        await sendAI(gid, "Stopped task per unsend request.");
+        await sendAI(gid, say.unsendStopped());
         return;
       }
     }
@@ -2076,7 +2070,7 @@ async function main() {
   // group, else first whitelist entry, else skip until the first message
   // registers a recent thread.
   const readyTarget = isDual ? notifyTarget() : config.groupId;
-  const readyText = `bridge ready. workdir=${config.workdir} (see /help)`;
+  const readyText = say.ready(config.workdir);
   if (readyTarget) {
     await sendAI(readyTarget, readyText);
     console.log("[bridge] ready message sent");

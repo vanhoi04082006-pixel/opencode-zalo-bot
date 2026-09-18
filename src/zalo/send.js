@@ -5,6 +5,7 @@ import { config } from "../config.js";
 import { chunkText } from "../text.js";
 import { isLargeFile, parseZaloLimit, formatMb } from "../files.js";
 import { sentCli } from "../app/run-state.js";
+import { say } from "../flows/persona.js";
 
 // bridge.js sets these once after login (avoids circular import of api).
 let _getApi = () => null;
@@ -99,6 +100,19 @@ export async function sendBubble(threadId, text, threadType) {
   return { msgId: String(msgId), cliMsgId: await waitForCli(String(msgId), 8000) };
 }
 
+// Send a native Zalo sticker (persona emotions). {id, cateId, type} come from
+// resolveSticker (store cache or live store lookup). No text/caption in the
+// same call - the AI text is always delivered first by the caller.
+export async function sendStickerNow(threadId, sticker, threadType) {
+  const api = _getApi();
+  const type = threadType ?? getThreadType(threadId);
+  const { id, cateId, type: st } = sticker ?? {};
+  if (id === undefined || cateId === undefined || cateId === null || st === undefined) {
+    throw new Error("bad sticker payload");
+  }
+  return zsend(() => api.sendSticker({ id, cateId, type: st }, threadId, type), "sticker");
+}
+
 export async function deleteBubble(threadId, ids, threadType) {
   // Dual: keep progress bubbles forever (user wants terminal-style history).
   // deleteMessage(onlyMe) would only erase the BOT's own view anyway while the
@@ -169,12 +183,12 @@ export async function sendFiles(threadId, caption, absPaths, threadType) {
   const api = _getApi();
   const type = threadType ?? getThreadType(threadId);
   const tag = prefixFor();
-  const fileMsg = (p) => withTag(`file: ${fileLabel(p)}`, tag);
+  const fileMsg = (p) => withTag(say.fileTag(fileLabel(p)), tag);
   const paths = absPaths.slice(0, 5);
   if (caption) await sendAI(threadId, caption, threadType);
   const big = isLargeFile(totalBytes(paths));
   const t0 = Date.now();
-  if (big) await sendAI(threadId, `Sending-KEEP-REMOVE-ME`, threadType);
+  if (big) await sendAI(threadId, say.fileSending(), threadType);
   try {
     for (const p of paths) {
       await zsend(
@@ -187,11 +201,11 @@ export async function sendFiles(threadId, caption, absPaths, threadType) {
     const msg = e?.message ?? String(e);
     const lim = parseZaloLimit(msg);
     if (lim) {
-      await sendAI(threadId, `Zalo allows files up to ${lim}MB. Yours is ${formatMb(totalBytes(paths))} - try compressing/splitting and resend.`, threadType);
+      await sendAI(threadId, say.fileLimit(lim, formatMb(totalBytes(paths))), threadType);
     } else {
-      await sendAI(threadId, `File send failed: ${msg.slice(0, 300)}`, threadType);
+      await sendAI(threadId, say.fileFailed(msg.slice(0, 300)), threadType);
     }
     return;
   }
-  if (big) await sendAI(threadId, `Sent (${fmtDur(Date.now() - t0)}).`, threadType);
+  if (big) await sendAI(threadId, say.fileSent(fmtDur(Date.now() - t0)), threadType);
 }

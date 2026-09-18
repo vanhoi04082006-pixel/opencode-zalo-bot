@@ -12,6 +12,7 @@ import { ThreadType } from "zca-js";
 import { config, isDualAccount, isOwner } from "../config.js";
 import { queues, getThreadOwner } from "../app/run-state.js";
 import { sendAI, sendFiles, fileLabel, getThreadType } from "../zalo/send.js";
+import { say } from "./persona.js";
 import { runPrompt } from "./prompt.js";
 import { detectYesNo } from "../intent.js";
 import { aliveDir } from "../files.js";
@@ -42,8 +43,8 @@ export async function doPowerAction(tid, action, seconds) {
   const err = await new Promise((resolve) => {
     execFile("shutdown.exe", args, (e) => resolve(e ? e.message : null));
   });
-  if (err) await sendAI(tid, `Command failed: ${err.slice(0, 200)}`);
-  else await sendAI(tid, `Scheduled ${what} in ${seconds}s. Cancel: /cancel-shutdown`);
+  if (err) await sendAI(tid, say.powerFailed(err.slice(0, 200)));
+  else await sendAI(tid, say.powerDone(what, seconds));
 }
 
 export function askPowerConfirm(tid, action, seconds) {
@@ -51,7 +52,7 @@ export function askPowerConfirm(tid, action, seconds) {
   const what = action === "reboot" ? "REBOOT" : "SHUTDOWN";
   store.pending[tid] = { kind: "confirm-shutdown", action, seconds, ts: Date.now(), by: getThreadOwner(tid) };
   saveStore(store);
-  return sendAI(tid, `Are you sure you want ${what} in ${seconds}s? Reply yes to proceed, no to cancel. (Expires in 2 min)`);
+  return sendAI(tid, say.powerAsk(what, seconds));
 }
 
 // Shared 1/2/3 parser for perm + sensitive-file + sensitive-attach
@@ -124,13 +125,13 @@ export async function tryConsumePending(threadId, t, isCmd, uid) {
       if (Date.now() - (conf.ts ?? 0) > 120000) {
         delete store.pending[threadId];
         saveStore(store);
-        await sendAI(threadId, "Confirmation expired (2 min). Resend the command if needed.");
+        await sendAI(threadId, say.powerExpired());
         return true;
       }
       delete store.pending[threadId];
       saveStore(store);
       if (yn === "no") {
-        await sendAI(threadId, "Cancelled, PC stays on.");
+        await sendAI(threadId, say.powerCancelled());
         return true;
       }
       await doPowerAction(threadId, conf.action, conf.seconds);
@@ -190,18 +191,17 @@ const pmBox = store.pending[threadId];
 const pm = peekPermQueue(store, threadId);
 if (!isCmd && pm) {
   const rep = parseOnceAlwaysDeny(t);
-  if (!rep) {
-    await sendAI(threadId, "Reply: 1 = allow once, 2 = always, 3 = deny.");
-    return true;
-  }
-  const leftNote = (n) => (n > 0 ? ` Còn ${n} quyền chờ: trả lời 1/2/3 tiếp.` : "");
-  const repLabel = rep === "once" ? "allowed once" : rep === "always" ? "always" : "denied";
+    if (!rep) {
+      await sendAI(threadId, say.sensitiveAsk((sp.paths ?? []).slice(0, 3).map((p) => fileLabel(p)).join(", ")));
+      return true;
+    }
+  const repLabel = rep === "once" ? "cho 1 lần" : rep === "always" ? "luôn luôn" : "từ chối";
   try {
     const replyDir = pm.sesDir ?? pm.directory;
     await replyPermission(client, { requestID: pm.requestID, directory: replyDir, reply: rep });
     const left = shiftPermQueue(store, threadId, pm.requestID);
     saveStore(store);
-    await sendAI(threadId, `Sent: ${repLabel}.${leftNote(left)}`);
+    await sendAI(threadId, say.permSent(repLabel, left));
   } catch (e) {
     const msg = e?.message ?? String(e);
     // Stale request (server replaced the id) -> find equivalent request and auto-reply
@@ -217,16 +217,16 @@ if (!isCmd && pm) {
           await replyPermission(client, { requestID: equiv.id, directory: pm.sesDir ?? pm.directory, reply: rep });
           const left = shiftPermQueue(store, threadId, pm.requestID);
           saveStore(store);
-          await sendAI(threadId, `Sent (new request): ${repLabel}.${leftNote(left)}`);
+          await sendAI(threadId, say.permSentNew(repLabel, left));
           return true;
         }
       } catch {}
       shiftPermQueue(store, threadId, pm.requestID);
       saveStore(store);
-      await sendAI(threadId, "Request expired (server replaced it or it passed). Ask the AI to redo that step.");
+      await sendAI(threadId, say.permExpired());
       return true;
     }
-    await sendAI(threadId, `Send failed, retry 1/2/3 (/abort to cancel).`);
+    await sendAI(threadId, say.permFailed());
   }
   return true;
 }
@@ -236,16 +236,16 @@ if (!isCmd && pm) {
   if (!isCmd && qp?.kind === "qa") {
     const ans = parseQAAnswer(t, qp.questions ?? []);
     if (!ans) {
-      await sendAI(threadId, "Unclear. Reply a number (ex 2 / 1:2) or type a custom answer. (/abort to cancel)");
+      await sendAI(threadId, say.qaUnclear());
       return true;
     }
     try {
       await replyQuestion(client, { requestID: qp.requestID, directory: qp.directory, answers: ans });
       delete store.pending[threadId];
       saveStore(store);
-      await sendAI(threadId, "Answer sent.");
+      await sendAI(threadId, say.qaSent());
     } catch (e) {
-      await sendAI(threadId, `Send failed: ${(e?.message ?? e).slice(0, 200)} (/abort to cancel)`);
+      await sendAI(threadId, say.qaFailed((e?.message ?? e).slice(0, 200)));
     }
     return true;
   }
@@ -254,14 +254,14 @@ if (!isCmd && pm) {
   if (!isCmd && sp?.kind === "sensitive-file") {
     const rep = parseOnceAlwaysDeny(t);
     if (!rep) {
-      await sendAI(threadId, "Reply: 1 = allow once, 2 = always (this session), 3 = deny.");
+      await sendAI(threadId, say.sensitiveAsk((sp.paths ?? []).slice(0, 3).map((p) => fileLabel(p)).join(", ")));
       return true;
     }
     const paths = sp.paths ?? [];
     delete store.pending[threadId];
     if (rep === "reject") {
       saveStore(store);
-      await sendAI(threadId, "Cancelled, sensitive file not sent.");
+      await sendAI(threadId, say.sensitiveDeny());
       return true;
     }
     if (rep === "always") {
@@ -276,7 +276,7 @@ if (!isCmd && pm) {
       }
     }
     saveStore(store);
-    await sendAI(threadId, rep === "always" ? "Noted, sending file..." : "Approved, sending file...");
+    await sendAI(threadId, say.sendNoted(rep === "always"));
     await sendFiles(threadId, null, paths);
     return true;
   }
@@ -296,7 +296,7 @@ if (!isCmd && pm) {
     }
     const chosen = (lsp.candidates ?? [])[n - 1];
     if (!chosen) {
-      await sendAI(threadId, "Invalid number.");
+      await sendAI(threadId, say.pickInvalid());
       return true;
     }
     if (chosen.isDir) {
@@ -311,18 +311,18 @@ if (!isCmd && pm) {
   if (!isCmd && sap?.kind === "sensitive-attach") {
     const rep = parseOnceAlwaysDeny(t);
     if (!rep) {
-      await sendAI(threadId, "Sensitive file. Reply: 1 = attach, 3 = cancel.");
+      await sendAI(threadId, say.sensitiveAttachAsk());
       return true;
     }
     const p = sap.path;
     delete store.pending[threadId];
     saveStore(store);
     if (rep === "reject") {
-      await sendAI(threadId, "Attachment cancelled.");
+      await sendAI(threadId, say.attachCancelled());
       return true;
     }
     act.setLsAttach(threadId, p);
-    await sendAI(threadId, `Attached '${p.split(path.sep).pop()}' to your next prompt. Send any message to ask.`);
+    await sendAI(threadId, say.attachOk(p.split(path.sep).pop()));
     return true;
   }
   const pick = store.pending[threadId];
@@ -332,14 +332,14 @@ if (!isCmd && pm) {
     if (Date.now() - (pick.ts ?? 0) > 300000) {
       delete store.pending[threadId];
       saveStore(store);
-      await sendAI(threadId, "Selection expired.");
+      await sendAI(threadId, say.pickExpired(""));
       return true;
     }
     const yn = detectYesNo(t);
     if (yn === "no" || t.trim() === "3") {
       delete store.pending[threadId];
       saveStore(store);
-      await sendAI(threadId, "Thôi, không tạo nhóm.");
+      await sendAI(threadId, say.confirmWorkNo());
       return true;
     }
     if (yn === "yes" || t.trim() === "1") {
@@ -350,7 +350,7 @@ if (!isCmd && pm) {
       await act.startWork(threadId, dir, purpose);
       return true;
     }
-    await sendAI(threadId, `Mở nhóm làm việc ở ${pick.dir}? 1 = tạo, 3 = thôi.`);
+    await sendAI(threadId, say.confirmWork(pick.dir));
     return true;
   }
   // Bare-name project pick: choose number first, then confirm-work asks.
@@ -358,24 +358,24 @@ if (!isCmd && pm) {
     if (Date.now() - (pick.ts ?? 0) > 300000) {
       delete store.pending[threadId];
       saveStore(store);
-      await sendAI(threadId, "Selection expired. Send /work again.");
+      await sendAI(threadId, say.pickExpired("Send /work again."));
       return true;
     }
     const dir = (pick.candidates ?? [])[Number(t) - 1];
     if (!dir) {
-      await sendAI(threadId, `Pick a number 1-${(pick.candidates ?? []).length}.`);
+      await sendAI(threadId, say.pickRange((pick.candidates ?? []).length));
       return true;
     }
     store.pending[threadId] = { kind: "confirm-work", dir, purpose: pick.purpose ?? dir, ts: Date.now(), by: getThreadOwner(threadId) };
     saveStore(store);
-    await sendAI(threadId, `Mở nhóm làm việc ở ${dir}?\n1 = tạo nhóm, 3 = thôi.`);
+    await sendAI(threadId, say.confirmWork(dir));
     return true;
   }
   // Cancel picking (pickproject/picksession/...): reply no/cancel
   if (pick && ["pickproject", "picksession", "pickfile", "pickmodel", "pickvariant", "pickmessage", "pickcommand", "pickskill", "pickqueue", "pickwork", "confirm-work"].includes(pick.kind) && detectYesNo(t) === "no") {
     delete store.pending[threadId];
     saveStore(store);
-    await sendAI(threadId, "Selection cancelled.");
+    await sendAI(threadId, say.pickCancelled());
     return true;
   }
   if (pick && ["pickfile", "picksession", "pickmodel", "pickvariant", "pickproject", "pickqueue"].includes(pick.kind) && /^\d{1,2}$/.test(t)) {
@@ -433,7 +433,7 @@ if (!isCmd && pm) {
         if (isDMThread) {
           store.pending[threadId] = { kind: "confirm-work", dir: chosen, purpose: chosen, ts: Date.now(), by: getThreadOwner(threadId) };
           saveStore(store);
-          await sendAI(threadId, `Mở nhóm làm việc ở ${chosen}?\n1 = tạo nhóm, 3 = thôi. (Dir hiện tại của chat này không đổi.)`);
+          await sendAI(threadId, say.confirmWorkKeepDir(chosen));
           return true;
         }
         delete store.pending[threadId];
@@ -447,7 +447,7 @@ if (!isCmd && pm) {
         delete store.pending[threadId];
         saveStore(store);
         if (!removed) {
-          await sendAI(threadId, "Invalid number (queue changed). Send /queue again.");
+          await sendAI(threadId, say.pickInvalid() + say.pickStale());
           return true;
         }
         q.splice(Number(t) - 1, 1);
@@ -494,10 +494,7 @@ export async function handlePermAsked(threadId, dir, props, sid) {
   if (!box.by) box.by = getThreadOwner(threadId);
   saveStore(store);
   const what = [props.permission, ...((props.patterns ?? []).slice(0, 3))].filter(Boolean).join(" ").slice(0, 300);
-  await sendAI(
-    threadId,
-    `opencode requests permission${box.items.length > 1 ? ` (${box.items.length} chờ)` : ""}: ${what || "?"}. Reply: 1 = allow once, 2 = always, 3 = deny.`
-  );
+  await sendAI(threadId, say.permAsk(what, box.items.length));
 }
 
 export async function handleQuestionAsked(threadId, dir, props) {
@@ -513,10 +510,7 @@ export async function handleQuestionAsked(threadId, dir, props) {
     const opts = (q.options ?? []).map((o, j) => `${j + 1}. ${o.label}${o.description ? " - " + o.description : ""}`);
     return `Q${i + 1}${q.header ? ` (${q.header})` : ""}: ${q.question}\n${opts.join("\n")}`;
   });
-  await sendAI(
-    threadId,
-    `AI asks:\n${blocks.join("\n")}\nReply a number ("2" or "1:2"), or type a custom answer.`
-  );
+  await sendAI(threadId, say.qaAsk(blocks.join("\n")));
 }
 
 // Parse tra loi QA: "2" | "1,3" | "1:2, 2:1" | text tu do
