@@ -1,5 +1,5 @@
 // Live progress bubbles: delete old message + send new one (fake streaming for Zalo)
-import { say } from "./flows/persona.js";
+import { sayFor } from "./flows/persona.js";
 
 const INTERVAL_MS = 60000;
 const MAX_UPDATES = 15;
@@ -22,7 +22,7 @@ export function createProgress({ sendBubble, deleteBubble, sendTyping, getTodos,
   };
 
   function compose(st) {
-    const lines = [say.progressHead(fmtDur(Date.now() - st.startedAt), st.title)];
+    const lines = [sayFor(st.threadId).progressHead(fmtDur(Date.now() - st.startedAt), st.title)];
     if (st.tool) lines.push(`🔧 ${st.tool}`);
     const done = (st.todos ?? []).filter((t) => t.status === "completed").slice(-3);
     const doing = (st.todos ?? []).filter((t) => t.status === "in_progress").slice(0, 2);

@@ -220,3 +220,26 @@ export function extractAttachment(content) {
   const name = content.title ?? content.description ?? content.fileName ?? null;
   return { href, name: name && String(name).includes(".") ? String(name) : null };
 }
+
+// Inbound Zalo sticker id from message content ({id,catId,type}).
+// Returns a positive number or null (unknown shape -> null, never throws).
+export function parseStickerId(content) {
+  try {
+    if (!content || typeof content !== "object") return null;
+    const raw = content.id ?? content.stickerId ?? content.sid ?? null;
+    const n = Number(raw);
+    if (Number.isInteger(n) && n > 0) return n;
+    // params may carry a JSON string with the id
+    const p = content.params;
+    if (typeof p === "string" && p.includes("sticker")) {
+      try {
+        const o = JSON.parse(p);
+        const m = Number(o?.id ?? o?.stickerId ?? o?.sid ?? NaN);
+        if (Number.isInteger(m) && m > 0) return m;
+      } catch {}
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}

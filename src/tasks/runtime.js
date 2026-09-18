@@ -3,8 +3,8 @@ import { parseCron, nextCronRun } from "../tasks.js";
 import { getSession, sendPromptAsync } from "../opencode.js";
 import { runs } from "../app/run-state.js";
 import { sendAI } from "../zalo/send.js";
-import { say } from "../flows/persona.js";
-import { ZALO_SYSTEM } from "../flows/system-prompt.js";
+import { sayFor } from "../flows/persona.js";
+import { systemFor } from "../flows/system-prompt.js";
 
 // Task hen gio (cron chuan + tieng Viet don gian).
 // bridge.js injects live singletons once (avoids circular import).
@@ -97,13 +97,13 @@ export async function fireTask(id) {
       directory: task.dir,
       ...(task.model ? { model: task.model } : {}),
       ...(task.agent ? { agent: task.agent } : {}),
-      system: ZALO_SYSTEM,
+      system: systemFor(groupId),
       parts: [{ type: "text", text: `[Task hen gio "${task.name}"] ${task.text}` }],
     });
   } catch (e) {
     delete runs[task.sessionID];
     await prog.stop(task.sessionID, true).catch(() => {});
-    await sendAI(groupId, say.taskRunFailed(task.name, String(e?.message ?? e).slice(0, 200)));
+    await sendAI(groupId, sayFor(groupId).taskRunFailed(task.name, String(e?.message ?? e).slice(0, 200)));
   } finally {
     if (task.kind === "once") {
       removeTask(id, true);
@@ -117,7 +117,7 @@ export function loadTasksOnBoot() {
   for (const task of [...getTasks()]) {
     if (task.kind === "once" && (task.runAt ?? 0) <= Date.now()) {
       removeTask(task.id, true);
-      sendAI(task.groupId, say.taskExpiredDropped(task.name)).catch(() => {});
+      sendAI(task.groupId, sayFor(task.groupId).taskExpiredDropped(task.name)).catch(() => {});
       continue;
     }
     scheduleTask(task);

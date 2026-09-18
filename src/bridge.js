@@ -15,6 +15,7 @@ import {
   formatMb,
   downloadToInbox,
   extractAttachment,
+  parseStickerId,
   INBOUND_LABEL,
 } from "./files.js";
 import { loginZalo, loginBot, getCookieHeader } from "./zalo-login.js";
@@ -42,7 +43,7 @@ import {
 import { detectShutdownIntent, detectDirIntent } from "./intent.js";
 import { buildStatusHeader } from "./flows/status.js";
 import { CENTER_SYSTEM } from "./flows/system-prompt.js";
-import { parseStickerTag, say } from "./flows/persona.js";
+import { parseStickerTag, sayFor, initPersonaScope } from "./flows/persona.js";
 import { execFile, spawn } from "node:child_process";
 import { listTopDirs, buildIndex, searchFiles, norm } from "./filefind.js";
 import { parseSchedule, describeTask, fmtTime } from "./tasks.js";
@@ -116,6 +117,7 @@ function notifyTarget() {
   return recentThreads[0]?.id ?? null;
 }
 initSender({ getApi: () => api, getOwnUid: () => ownUid, getIsDual: () => isDual, getStore: () => store });
+initPersonaScope({ getIsDual: () => isDual, getThreadType });
 
 // Whole-drive file index (background build, refresh every 10 min)
 
@@ -150,13 +152,13 @@ initInteraction({
 
 // Stop/restart serve after natural yes-confirm (pending confirm-serve)
 async function serveConfirm(threadId, action) {
-  await sendAI(threadId, say.serveWorking(action));
+  await sendAI(threadId, sayFor(threadId).serveWorking(action));
   const stopped = await stopServe();
   if (action === "restart") {
     const ok = await ensureServe(true);
-    await sendAI(threadId, say.serveRestarted(ok));
+    await sendAI(threadId, sayFor(threadId).serveRestarted(ok));
   } else {
-    await sendAI(threadId, say.serveStopped(stopped));
+    await sendAI(threadId, sayFor(threadId).serveStopped(stopped));
   }
 }
 
@@ -392,10 +394,10 @@ function startWatchdog(groupId) {
       const target = groupId ?? notifyTarget();
       if (!up && !serveWasDown) {
         serveWasDown = true;
-        if (target) await sendAI(target, say.serveDown()).catch(() => {});
+        if (target) await sendAI(target, sayFor(target).serveDown()).catch(() => {});
         const ok = await ensureServe();
         serveWasDown = !ok;
-        if (target) await sendAI(target, ok ? say.serveBack() : say.serveBackFailed()).catch(() => {});
+        if (target) await sendAI(target, ok ? sayFor(target).serveBack() : sayFor(target).serveBackFailed()).catch(() => {});
       } else if (up && serveWasDown) {
         serveWasDown = false;
       }
@@ -488,10 +490,10 @@ async function handleGroupText(threadId, text, msgId, uid, cliMsgId) {
     if (!sid) {
       delete queues[threadId];
       saveStore(store);
-      await sendAI(threadId, say.abortNoSession());
+      await sendAI(threadId, sayFor(threadId).abortNoSession());
       return;
     }
-    await sendAI(threadId, say.abortStopping());
+    await sendAI(threadId, sayFor(threadId).abortStopping());
     if (runs[sid]) runs[sid].userAborted = true;
     delete queues[threadId];
     delete store.pending[threadId];
@@ -509,18 +511,18 @@ async function handleGroupText(threadId, text, msgId, uid, cliMsgId) {
     await prog.stop(sid, true);
     delete runs[sid];
     if (st === "idle" || st === "not-found") {
-      await sendAI(threadId, say.abortStopped());
+      await sendAI(threadId, sayFor(threadId).abortStopped());
     } else if (!aborted) {
-      await sendAI(threadId, say.abortTimeout());
+      await sendAI(threadId, sayFor(threadId).abortTimeout());
     } else {
-      await sendAI(threadId, say.abortBusy());
+      await sendAI(threadId, sayFor(threadId).abortBusy());
     }
     return;
   }
   if (t === "/ok") {
     const p = store.pending[threadId];
     if (!p) {
-      await sendAI(threadId, say.okNothing());
+      await sendAI(threadId, sayFor(threadId).okNothing());
       return;
     }
     // Dual: only the pending creator may approve (anti-hijack, same rule as tryConsumePending).
@@ -554,13 +556,13 @@ async function handleGroupText(threadId, text, msgId, uid, cliMsgId) {
     const err = await new Promise((resolve) => {
       execFile("shutdown.exe", ["/a"], (e) => resolve(e ? e.message : null));
     });
-    await sendAI(threadId, err ? say.powerNone(err.slice(0, 120)) : say.powerCancelled());
+    await sendAI(threadId, err ? sayFor(threadId).powerNone(err.slice(0, 120)) : sayFor(threadId).powerCancelled());
     return;
   }
 
   if (t === "/opencode_start") {
     const ok = await ensureServe(true);
-    await sendAI(threadId, say.serveRunning(ok));
+    await sendAI(threadId, sayFor(threadId).serveRunning(ok));
     return;
   }
   if (t === "/opencode_stop" || t === "/opencode_restart") {
@@ -857,7 +859,7 @@ async function handleGroupText(threadId, text, msgId, uid, cliMsgId) {
       delete store.pending[threadId];
       saveStore(store);
       if (!chosen) {
-        await sendAI(threadId, say.pickInvalid());
+        await sendAI(threadId, sayFor(threadId).pickInvalid());
         return;
       }
       await fireCommand(threadId, chosen, "");
@@ -893,7 +895,7 @@ async function handleGroupText(threadId, text, msgId, uid, cliMsgId) {
       delete store.pending[threadId];
       saveStore(store);
       if (!chosen) {
-        await sendAI(threadId, say.pickInvalid());
+        await sendAI(threadId, sayFor(threadId).pickInvalid());
         return;
       }
       await fireCommand(threadId, chosen, "");
@@ -968,7 +970,7 @@ async function handleGroupText(threadId, text, msgId, uid, cliMsgId) {
     }
     const mid = (p.candidates ?? [])[Number(num) - 1];
     if (!mid) {
-      await sendAI(threadId, say.pickInvalid());
+      await sendAI(threadId, sayFor(threadId).pickInvalid());
       return;
     }
     const sid = store.sessions[threadId];
@@ -1021,7 +1023,7 @@ async function handleGroupText(threadId, text, msgId, uid, cliMsgId) {
       }
       const mid = (p.candidates ?? [])[Number(arg) - 1];
       if (!mid) {
-        await sendAI(threadId, say.pickInvalid());
+        await sendAI(threadId, sayFor(threadId).pickInvalid());
         return;
       }
       const sid = store.sessions[threadId];
@@ -1074,23 +1076,23 @@ async function handleGroupText(threadId, text, msgId, uid, cliMsgId) {
       const n = Number(del[2]);
       const removed = q[n - 1];
       if (!removed) {
-        await sendAI(threadId, say.pickInvalid());
+        await sendAI(threadId, sayFor(threadId).pickInvalid());
         return;
       }
       q.splice(n - 1, 1);
-      await sendAI(threadId, say.queueDeleted(n, removed.text ? `: "${removed.text.slice(0, 60)}"` : ""));
+      await sendAI(threadId, sayFor(threadId).queueDeleted(n, removed.text ? `: "${removed.text.slice(0, 60)}"` : ""));
       return;
     }
     if (!q.length) {
       const sid = store.sessions[threadId];
-      await sendAI(threadId, say.queueEmpty(!!runs[sid]?.busy));
+      await sendAI(threadId, sayFor(threadId).queueEmpty(!!runs[sid]?.busy));
       return;
     }
     store.pending[threadId] = { kind: "pickqueue", candidates: q.map((_, i) => i), ts: Date.now(), by: getThreadOwner(threadId) };
     saveStore(store);
     await sendAI(
       threadId,
-      say.queueList(q.map((item, i) => `${i + 1}. ${(item.text ?? `/${item.command ?? ""}`).slice(0, 80)}`).join("\n"))
+      sayFor(threadId).queueList(q.map((item, i) => `${i + 1}. ${(item.text ?? `/${item.command ?? ""}`).slice(0, 80)}`).join("\n"))
     );
     return;
   }
@@ -1100,12 +1102,12 @@ async function handleGroupText(threadId, text, msgId, uid, cliMsgId) {
     // Single: one thread anyway, behavior unchanged.
     const items = isDual ? getTasks().filter((x) => String(x.groupId) === String(threadId)) : getTasks();
     if (!items.length) {
-      await sendAI(threadId, say.taskNone());
+      await sendAI(threadId, sayFor(threadId).taskNone());
       return;
     }
     await sendAI(
       threadId,
-      say.taskList(items.map((x, i) => `${i + 1}. ${describeTask(x)}`).join("\n"), items.length)
+      sayFor(threadId).taskList(items.map((x, i) => `${i + 1}. ${describeTask(x)}`).join("\n"), items.length)
     );
     return;
   }
@@ -1115,11 +1117,11 @@ async function handleGroupText(threadId, text, msgId, uid, cliMsgId) {
     const items = isDual ? getTasks().filter((x) => String(x.groupId) === String(threadId)) : getTasks();
     const item = items[Number(taskdel[1]) - 1];
     if (!item) {
-      await sendAI(threadId, say.taskInvalid());
+      await sendAI(threadId, sayFor(threadId).taskInvalid());
       return;
     }
     removeTask(item.id, true);
-    await sendAI(threadId, say.taskDeleted(item.name));
+    await sendAI(threadId, sayFor(threadId).taskDeleted(item.name));
     return;
   }
 
@@ -1127,17 +1129,17 @@ async function handleGroupText(threadId, text, msgId, uid, cliMsgId) {
     const rest = t.replace(/^\/task\s*/, "").trim();
     const sep = rest.indexOf("|");
     if (sep < 0) {
-      await sendAI(threadId, say.taskUsage());
+      await sendAI(threadId, sayFor(threadId).taskUsage());
       return;
     }
     const schedRaw = rest.slice(0, sep).trim();
     const text = rest.slice(sep + 1).trim();
     if (!text) {
-      await sendAI(threadId, say.taskMissingJob());
+      await sendAI(threadId, sayFor(threadId).taskMissingJob());
       return;
     }
     if (getTasks().length >= 10) {
-      await sendAI(threadId, say.taskMax());
+      await sendAI(threadId, sayFor(threadId).taskMax());
       return;
     }
     const parsed = parseSchedule(schedRaw);
@@ -1166,10 +1168,10 @@ async function handleGroupText(threadId, text, msgId, uid, cliMsgId) {
     scheduleTask(task);
     const again = getTasks().find((x) => x.id === task.id);
     if (task.kind === "once" && !again) {
-      await sendAI(threadId, say.taskTimePassed());
+      await sendAI(threadId, sayFor(threadId).taskTimePassed());
       return;
     }
-    await sendAI(threadId, say.taskScheduled(describeTask(again ?? task)));
+    await sendAI(threadId, sayFor(threadId).taskScheduled(describeTask(again ?? task)));
     return;
   }
 
@@ -1261,7 +1263,7 @@ async function handleGroupText(threadId, text, msgId, uid, cliMsgId) {
     const real = chk.path ?? shotPath;
     store.pending[threadId] = { kind: "sensitive-file", paths: [real], ts: Date.now(), by: getThreadOwner(threadId) };
     saveStore(store);
-    await sendAI(threadId, say.shotAsk(fileLabel(real)));
+    await sendAI(threadId, sayFor(threadId).shotAsk(fileLabel(real)));
     return;
   }
 
@@ -1293,7 +1295,7 @@ async function handleGroupText(threadId, text, msgId, uid, cliMsgId) {
 
   // Hard block: drive format, Windows system delete (no approval path)
   if (/format\s+[a-z]:/i.test(t) || /(del|rmdir|rd|remove-item)[\s\S]{0,60}c:\\windows/i.test(t)) {
-    await sendAI(threadId, say.hardBlocked());
+    await sendAI(threadId, sayFor(threadId).hardBlocked());
     return;
   }
 
@@ -1302,7 +1304,7 @@ async function handleGroupText(threadId, text, msgId, uid, cliMsgId) {
   if (danger && !store.pending[threadId]) {
     store.pending[threadId] = { kind: "text", text: t, ts: Date.now(), by: getThreadOwner(threadId) };
     saveStore(store);
-    await sendAI(threadId, say.dangerAsk(danger));
+    await sendAI(threadId, sayFor(threadId).dangerAsk(danger));
     return;
   }
 
@@ -1323,13 +1325,13 @@ async function doWorkCommand(threadId, raw) {
   const cands = r.candidates.slice(0, 8);
   store.pending[threadId] = { kind: "pickwork", candidates: cands, purpose: raw, ts: Date.now(), by: getThreadOwner(threadId) };
   saveStore(store);
-  await sendAI(threadId, say.pickWorkMany(cands.map((d, i) => `${i + 1}. ${d}`).join("\n")));
+  await sendAI(threadId, sayFor(threadId).pickWorkMany(cands.map((d, i) => `${i + 1}. ${d}`).join("\n")));
 }
 
 async function doGroupsCommand(threadId) {
   const entries = Object.entries(store.projectGroups ?? {});
   if (!entries.length) {
-    await sendAI(threadId, say.groupsEmpty());
+    await sendAI(threadId, sayFor(threadId).groupsEmpty());
     return;
   }
   // Verify liveness in one batched call (report only - fixes happen in /work).
@@ -1351,7 +1353,7 @@ async function doGroupsCommand(threadId) {
   const stateNote = (s) => (s === "ok" ? "" : s === "owner-left" ? " [bạn đã rời - /work để mời lại]" : s === "gone" ? " [đã giải tán - /work để tạo lại]" : "");
   await sendAI(
     threadId,
-    say.groupsList(
+    sayFor(threadId).groupsList(
       entries
         .map(([k, pg], i) => `${i + 1}. ${pg.name ?? k}${pg.purpose ? ` — ${pg.purpose}` : ""} (dùng cuối ${fmtTs(pg.lastUsed)})${stateNote(states[pg.groupId])}`)
         .join("\n")
@@ -1372,11 +1374,11 @@ function isDMGreeting(t) {
 async function handleDMsoft(threadId, t) {
   const nn = norm(t);
   if (isDMGreeting(t)) {
-    await sendAI(threadId, say.greeting());
+    await sendAI(threadId, sayFor(threadId).greeting());
     return true;
   }
   if (/\b(help|giup|tro giup|huong dan|lenh|danh sach lenh|em lam duoc gi|giup duoc gi)\b/.test(nn)) {
-    await sendAI(threadId, say.dmHelp());
+    await sendAI(threadId, sayFor(threadId).dmHelp());
     return true;
   }
   if (/\b(nhom|nhom nao|group|ds nhom|danh sach)\b/.test(nn) && !/\b(tao|mo|them|work)\b/.test(nn)) {
@@ -1399,7 +1401,7 @@ async function handleDMsoft(threadId, t) {
         return norm(base) === q || norm(String(p.name ?? "")) === q;
       });
       if (matches.length === 1) {
-        await sendAI(threadId, say.suggestWork(matches[0].worktree));
+        await sendAI(threadId, sayFor(threadId).suggestWork(matches[0].worktree));
         return true;
       }
       if (matches.length > 1) {
@@ -1484,7 +1486,7 @@ async function startWork(dmThreadId, dir, purpose) {
         reused = true;
         reinvited = true;
       } catch (e) {
-        await sendAI(dmThreadId, say.groupLeftReinviteFailed(name, String(e?.message ?? e).slice(0, 150)));
+        await sendAI(dmThreadId, sayFor(dmThreadId).groupLeftReinviteFailed(name, String(e?.message ?? e).slice(0, 150)));
         return;
       }
     } else {
@@ -1517,7 +1519,7 @@ async function startWork(dmThreadId, dir, purpose) {
     }
   }
   if (!groupId) {
-    await sendAI(dmThreadId, say.groupCreating(name));
+    await sendAI(dmThreadId, sayFor(dmThreadId).groupCreating(name));
     try {
       const res = await api.createGroup({ name, members: requester ? [requester] : [] });
       if (!res?.groupId) {
@@ -1525,7 +1527,7 @@ async function startWork(dmThreadId, dir, purpose) {
       }
       groupId = res.groupId;
     } catch (e) {
-      await sendAI(dmThreadId, say.groupCreateFailed(String(e?.message ?? e).slice(0, 200)));
+      await sendAI(dmThreadId, sayFor(dmThreadId).groupCreateFailed(String(e?.message ?? e).slice(0, 200)));
       return;
     }
   }
@@ -1555,7 +1557,7 @@ async function startWork(dmThreadId, dir, purpose) {
   await sendAI(groupId, `${header}\n📌 Bạn ghim tay tin này giúp nhé (Zalo không cho bot tự ghim).`);
   await sendAI(
     dmThreadId,
-    reinvited ? say.groupReinvited(name) : reused ? say.groupReused(name) : say.groupCreated(name)
+    reinvited ? sayFor(dmThreadId).groupReinvited(name) : reused ? sayFor(dmThreadId).groupReused(name) : sayFor(dmThreadId).groupCreated(name)
   );
 }
 
@@ -1817,17 +1819,57 @@ function toFilePart(absPath) {
   return { type: "file", mime, url: "file:///" + absPath.replace(/\\/g, "/") };
 }
 
+// Inbound owner sticker -> text meaning + vision, then natural reaction.
+// system defaults per scope (DM voice / group neutral) via runPrompt.
+async function handleStickerMessage(threadId, message, stickerId) {
+  const msgId = message?.data?.msgId !== undefined ? String(message.data.msgId) : null;
+  let detail = null;
+  if (stickerId) {
+    try {
+      const details = await api.getStickersDetail([stickerId]);
+      detail = (details ?? [])[0] ?? null;
+    } catch {}
+  }
+  const url = detail?.stickerWebpUrl || detail?.stickerUrl || detail?.stickerSpriteUrl || null;
+  let fp = null;
+  let savedAt = "";
+  if (url && stickerId) {
+    try {
+      const extGuess = (url.split("?")[0].split(".").pop() || "webp").toLowerCase().slice(0, 4);
+      const ext = ["png", "gif", "webp", "jpg", "jpeg"].includes(extGuess) ? extGuess : "webp";
+      const dl = await downloadToInbox(url, `sticker-${stickerId}.${ext}`, getCookieHeader(isDual ? config.botCredsPath : config.credsPath));
+      savedAt = ` saved at ${dl.path}`;
+      fp = toFilePart(dl.path);
+    } catch {}
+  }
+  const figured = detail?.text ? ` text="${detail.text}"` : "";
+  await runPrompt(
+    threadId,
+    `[sticker from owner id=${stickerId ?? "?"}${figured}${savedAt}. React to its emotion/meaning briefly, in your normal voice for this chat.]`,
+    false,
+    fp ? [fp] : [],
+    false,
+    msgId
+  );
+}
+
 async function handleAttachmentMessage(threadId, message) {
   // DM is a full command center: files land in the E:\ session and AI reads them here.
   const data = message?.data ?? {};
+  // Owner stickers: resolve meaning (store text) + let the model SEE it,
+  // then react in-voice. Works in DM and groups.
+  if (data.msgType === "chat.sticker") {
+    await handleStickerMessage(threadId, message, parseStickerId(data.content));
+    return;
+  }
   const label = INBOUND_LABEL[data.msgType] ?? null;
   if (!label) return; // sticker/link/... skipped to reduce noise
   const att = extractAttachment(data.content);
   if (!att) {
-    await sendAI(threadId, say.attachNoLink(label));
+    await sendAI(threadId, sayFor(threadId).attachNoLink(label));
     return;
   }
-  await sendAI(threadId, say.downloading(label));
+  await sendAI(threadId, sayFor(threadId).downloading(label));
   try {
     const dl = await downloadToInbox(att.href, att.name, getCookieHeader(isDual ? config.botCredsPath : config.credsPath));
     const warn = isExecFile(dl.path)
@@ -1845,7 +1887,7 @@ async function handleAttachmentMessage(threadId, message) {
       dmCenter ? CENTER_SYSTEM : null
     );
   } catch (e) {
-    await sendAI(threadId, say.downloadFailed(label, String(e?.message ?? e).slice(0, 300)));
+    await sendAI(threadId, sayFor(threadId).downloadFailed(label, String(e?.message ?? e).slice(0, 300)));
   }
 }
 
@@ -1893,7 +1935,7 @@ async function onUndo(undo) {
       if (idx >= 0) {
         const [rm] = q.splice(idx, 1);
         const preview = rm.text ? `: "${rm.text.slice(0, 60)}"` : "";
-        await sendAI(gid, say.unsendCancelledQueue(preview));
+        await sendAI(gid, sayFor(gid).unsendCancelledQueue(preview));
         return;
       }
     }
@@ -1905,7 +1947,7 @@ async function onUndo(undo) {
         clearRunTimers(sid);
         await prog.stop(sid, true);
         delete runs[sid];
-        await sendAI(gid, say.unsendStopped());
+        await sendAI(gid, sayFor(gid).unsendStopped());
         return;
       }
     }
@@ -2070,7 +2112,7 @@ async function main() {
   // group, else first whitelist entry, else skip until the first message
   // registers a recent thread.
   const readyTarget = isDual ? notifyTarget() : config.groupId;
-  const readyText = say.ready(config.workdir);
+  const readyText = sayFor(readyTarget).ready(config.workdir);
   if (readyTarget) {
     await sendAI(readyTarget, readyText);
     console.log("[bridge] ready message sent");

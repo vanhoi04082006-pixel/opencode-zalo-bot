@@ -5,7 +5,10 @@
 //   so this file is safe to commit.
 // Run: node scripts/test-persona.mjs
 import fs from "node:fs";
-import { PERSONA, STICKER_KEYWORDS, parseStickerTag, wrap, say, resolveSticker } from "../src/flows/persona.js";
+import { ThreadType } from "zca-js";
+import { PERSONA, STICKER_KEYWORDS, parseStickerTag, wrap, say, resolveSticker, initPersonaScope, isDMThread, sayFor, voiceFor } from "../src/flows/persona.js";
+import { detectYesNo, detectEmojiVerdict } from "../src/intent.js";
+import { parseStickerId } from "../src/files.js";
 
 let pass = 0;
 let fail = 0;
@@ -87,6 +90,50 @@ if (fs.existsSync(localPath)) {
   console.log("SKIP local pack (no persona.local.js)");
   ok(PERSONA.name === "Bot", "neutral name without local pack");
 }
+
+// Scope: personal pack is DM-only. Without init -> everything neutral.
+ok(!isDMThread("dm1"), "no init -> neutral scope");
+ok(sayFor("dm1").greeting() === sayFor("g1").greeting(), "no init -> same pack everywhere");
+initPersonaScope({ getIsDual: () => true, getThreadType: (id) => (id === "dm1" ? ThreadType.User : ThreadType.Group) });
+ok(isDMThread("dm1") && !isDMThread("g1") && !isDMThread(null), "isDMThread dual+User only");
+initPersonaScope({ getIsDual: () => false, getThreadType: () => ThreadType.User });
+ok(!isDMThread("dm1"), "single mode -> never DM scope");
+
+// Emoji verdicts: exact-short only, guarded.
+const emojiCases = [
+  ["👍", "yes"], ["👍🏻", "yes"], ["👍 1", "yes"], ["1 👍", "yes"],
+  ["👎", "no"], ["❌", "no"], ["❎", "no"], ["✖️", "no"], ["🚫", "no"], ["3 👎", "no"],
+  ["👍 2", null], ["ok 👍", null], ["Em 👍 cách này nhưng đừng chạy nhé", null],
+  ["👍👍", null], ["hello", null], ["", null], ["👍 3", null],
+];
+let emojiBad = 0;
+for (const [inp, exp] of emojiCases) {
+  if (detectEmojiVerdict(inp) !== exp) {
+    emojiBad++;
+    console.log(`FAIL emoji ${JSON.stringify(inp)}`);
+  }
+}
+ok(emojiBad === 0, "emoji verdict matrix");
+ok(detectYesNo("👍") === "yes" && detectYesNo("👎") === "no" && detectYesNo("ok") === "yes", "detectYesNo keeps words + emoji");
+
+// Inbound sticker id parsing (real shape: {id,catId,type}).
+const stickerCases = [
+  [{ id: 23037, catId: 10398, type: 7 }, 23037],
+  [{ stickerId: 5 }, 5],
+  [{ params: '{"stickerId":77}' }, 77],
+  [null, null],
+  [{}, null],
+  [{ id: "abc" }, null],
+  [{ id: -3 }, null],
+];
+let stickerBad = 0;
+for (const [inp, exp] of stickerCases) {
+  if (parseStickerId(inp) !== exp) {
+    stickerBad++;
+    console.log(`FAIL stickerId ${JSON.stringify(inp)}`);
+  }
+}
+ok(stickerBad === 0, "parseStickerId matrix");
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

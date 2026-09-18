@@ -23,8 +23,8 @@ import {
 } from "../files.js";
 import { runs, queues, chainGroup, clearRunTimers, getThreadOwner, isUnsent } from "../app/run-state.js";
 import { sendAI, sendFiles, sendStickerNow, fileLabel } from "../zalo/send.js";
-import { ZALO_SYSTEM, buildAnchor } from "./system-prompt.js";
-import { parseStickerTag, resolveSticker, say } from "./persona.js";
+import { buildAnchor, systemFor } from "./system-prompt.js";
+import { parseStickerTag, resolveSticker, sayFor, isDMThread } from "./persona.js";
 
 // bridge.js injects live singletons once (avoids circular import).
 let _getClient = () => null;
@@ -119,7 +119,7 @@ export function gateSensitiveFile(threadId, absPaths) {
   store.pending[threadId] = { kind: "sensitive-file", paths: absPaths, ts: Date.now(), by: getThreadOwner(threadId) };
   saveStore(store);
   const names = needAsk.slice(0, 3).map((p) => fileLabel(p)).join(", ");
-  sendAI(threadId, say.sensitiveAsk(names)).catch(() => {});
+  sendAI(threadId, sayFor(threadId).sensitiveAsk(names)).catch(() => {});
   return "ask";
 }
 
@@ -188,7 +188,7 @@ export async function startRun(threadId, sid, fullText, fileParts, fresh, firstT
       ...(model ? { model } : {}),
       ...(variant ? { variant } : {}),
       ...(agent ? { agent } : {}),
-      system: system ?? ZALO_SYSTEM,
+      system: system ?? systemFor(threadId),
       parts: [{ type: "text", text: anchor + fullText }, ...fileParts],
     });
   } catch (e) {
@@ -326,8 +326,10 @@ export async function deliverRun(threadId, sid) {
     if (freshTexts.length) {
       const tag = run.tag ? `[${run.tag}] ` : "";
       const rawReply = freshTexts.join("\n").trim() || "(opencode returned no text)";
-      const { text: reply, keyword } = parseStickerTag(rawReply);
-      const outText = reply || (keyword ? "" : "(opencode returned no text)");
+      const { text: reply, keyword: rawKeyword } = parseStickerTag(rawReply);
+      // Stickers live in DM scope only - group text is stripped silently.
+      const keyword = rawKeyword && isDMThread(threadId) ? rawKeyword : null;
+      const outText = reply || (rawKeyword ? "" : "(opencode returned no text)");
       if (outText) await sendAI(threadId, tag + outText);
       await deliverSticker(threadId, keyword);
       await autoAttachReply(threadId, reply);
@@ -375,12 +377,12 @@ export async function autoAttachReply(threadId, reply) {
         const store = getStore();
         store.pending[threadId] = { kind: "sensitive-file", paths: sendable, ts: Date.now(), by: getThreadOwner(threadId) };
         saveStore(store);
-        await sendAI(threadId, say.shotAsk(shots.map((p) => fileLabel(p)).join(", ")));
+        await sendAI(threadId, sayFor(threadId).shotAsk(shots.map((p) => fileLabel(p)).join(", ")));
         return;
       }
       const gate = gateSensitiveFile(threadId, sendable);
       if (gate === "deny") {
-        await sendAI(threadId, say.attachDeny());
+        await sendAI(threadId, sayFor(threadId).attachDeny());
         return;
       }
       if (gate === "ok") await sendFiles(threadId, null, sendable);
@@ -391,9 +393,9 @@ export async function autoAttachReply(threadId, reply) {
       const s0 = suspects[0];
       if (isOutsideScope(s0)) {
         const roots = [config.workdir, ...(config.extraRoots ?? [])].join(", ");
-        await sendAI(threadId, say.outsideScope(roots, s0.slice(0, 150)));
+        await sendAI(threadId, sayFor(threadId).outsideScope(roots, s0.slice(0, 150)));
       } else {
-        await sendAI(threadId, say.pathLike(s0));
+        await sendAI(threadId, sayFor(threadId).pathLike(s0));
       }
     }
   } catch (e) {

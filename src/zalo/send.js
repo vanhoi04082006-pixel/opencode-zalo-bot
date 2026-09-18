@@ -5,7 +5,7 @@ import { config } from "../config.js";
 import { chunkText } from "../text.js";
 import { isLargeFile, parseZaloLimit, formatMb } from "../files.js";
 import { sentCli } from "../app/run-state.js";
-import { say } from "../flows/persona.js";
+import { sayFor } from "../flows/persona.js";
 
 // bridge.js sets these once after login (avoids circular import of api).
 let _getApi = () => null;
@@ -183,12 +183,12 @@ export async function sendFiles(threadId, caption, absPaths, threadType) {
   const api = _getApi();
   const type = threadType ?? getThreadType(threadId);
   const tag = prefixFor();
-  const fileMsg = (p) => withTag(say.fileTag(fileLabel(p)), tag);
+  const fileMsg = (p) => withTag(sayFor(threadId).fileTag(fileLabel(p)), tag);
   const paths = absPaths.slice(0, 5);
   if (caption) await sendAI(threadId, caption, threadType);
   const big = isLargeFile(totalBytes(paths));
   const t0 = Date.now();
-  if (big) await sendAI(threadId, say.fileSending(), threadType);
+  if (big) await sendAI(threadId, sayFor(threadId).fileSending(), threadType);
   try {
     for (const p of paths) {
       await zsend(
@@ -201,11 +201,11 @@ export async function sendFiles(threadId, caption, absPaths, threadType) {
     const msg = e?.message ?? String(e);
     const lim = parseZaloLimit(msg);
     if (lim) {
-      await sendAI(threadId, say.fileLimit(lim, formatMb(totalBytes(paths))), threadType);
+      await sendAI(threadId, sayFor(threadId).fileLimit(lim, formatMb(totalBytes(paths))), threadType);
     } else {
-      await sendAI(threadId, say.fileFailed(msg.slice(0, 300)), threadType);
+      await sendAI(threadId, sayFor(threadId).fileFailed(msg.slice(0, 300)), threadType);
     }
     return;
   }
-  if (big) await sendAI(threadId, say.fileSent(fmtDur(Date.now() - t0)), threadType);
+  if (big) await sendAI(threadId, sayFor(threadId).fileSent(fmtDur(Date.now() - t0)), threadType);
 }

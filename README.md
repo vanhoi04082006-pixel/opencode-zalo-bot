@@ -75,10 +75,11 @@ Header `BotZalo` gồm: Project + branch (`vcs.get`, không phải git thì ẩn
 
 ## Persona (giọng bot + sticker)
 
-- Mọi tin hệ thống (quyền 1/2/3, hỏi đáp, shutdown, pick số, task...) đi qua `say.*` trong `src/flows/persona.js` — số/path/lệnh/`yes-no` giữ nguyên để parser không vỡ. Giọng AI đi qua `VOICE` trong cùng file.
-- Mặc định repo dùng pack neutral. Muốn giọng riêng: copy `src/flows/persona.local.example.js` thành `src/flows/persona.local.js` (**đã git-ignore, không bao giờ commit**) rồi sửa chuỗi, restart bridge là nhận. File local thiếu key nào thì rớt về neutral key đó.
+- Giọng cá nhân chỉ áp dụng cho **DM** (trung tâm điều phối). Nhóm làm việc luôn giọng neutral professional: không `nya`, không emoji thỏ, không sticker — tập trung làm việc. Chọn scope tự động theo thread (`sayFor`/`systemFor`); single mode luôn neutral.
+- Muốn giọng riêng: copy `src/flows/persona.local.example.js` thành `src/flows/persona.local.js` (**đã git-ignore, không bao giờ commit**) rồi sửa chuỗi, restart bridge là nhận. File local thiếu key nào thì rớt về neutral key đó.
 - **Emoji**: text unicode, luôn gửi được.
-- **Sticker Zalo native**: AI chèn tag `[sticker:<từ>]` cuối câu khi voice cho phép; bridge cắt tag, tra kho sticker (`searchSticker` + cache 30 ngày trong store), gửi sticker thật sau tin nhắn. Tối đa 1 sticker/reply, chỉ text AI. Từ lạ → bỏ qua im lặng. Pack neutral không dạy AI dùng tag nên pipeline nằm im.
+- **Sticker Zalo native**: AI chèn tag `[sticker:<từ>]` cuối câu khi voice cho phép; bridge cắt tag, tra kho sticker (`searchSticker` + cache 30 ngày trong store), gửi sticker thật sau tin nhắn. Tối đa 1 sticker/reply, chỉ text AI trong DM. Từ lạ → bỏ qua im lặng. Pack neutral không dạy AI dùng tag nên pipeline nằm im.
+- **Hiểu emoji/sticker/gif bạn gửi**: emoji trong text AI thấy sẵn; `👍✅👌` = đồng ý (1/yes), `👎❌` = từ chối (3/no) khi trả lời pending — chỉ nhận khi tin ngắn, đúng owner; sticker bạn gửi được tra nghĩa + cho AI nhìn ảnh rồi phản ứng; gif bạn gửi AI nhìn trực tiếp.
 - **Gif**: bot không tự gửi (không có kho gif nguồn); bạn gửi gif/file vào thì AI vẫn đọc như ảnh. Không upload sticker custom được (Zalo không có API) — workaround là gửi `.png/.webp` như ảnh thường.
 
 ## Tiến trình và typing

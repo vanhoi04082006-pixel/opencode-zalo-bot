@@ -9,7 +9,14 @@
 //   { PERSONA: { name, emoji: {...} }, say: { fn... }, VOICE: "..." }
 // wrap()/parseStickerTag()/resolveSticker()/STICKER_KEYWORDS are neutral
 // infrastructure and always stay in git.
+//
+// SCOPE (DM-only personal flavor): the merged global `say`/`VOICE` below
+// exist for backward compat. New code must use `sayFor(threadId)` /
+// `voiceFor(threadId)`: DM thread (dual + User) -> personal pack, every
+// other scope -> neutral pack. Scope resolvers are injected (same pattern
+// as initPrompt/initSender) so this leaf module never imports send.js.
 import fs from "node:fs";
+import { ThreadType } from "zca-js";
 
 const NEUTRAL_PERSONA = { name: "Bot", emoji: {} };
 
@@ -122,6 +129,52 @@ try {
 export const PERSONA = { ...NEUTRAL_PERSONA, ...(_local.PERSONA ?? {}) };
 export const say = { ...NEUTRAL_SAY, ...(_local.say ?? {}) };
 export const VOICE = _local.VOICE ?? NEUTRAL_VOICE;
+// Split pack exports for per-scope selection (see systemFor/sayFor).
+export { NEUTRAL_VOICE };
+export const MIMI_VOICE = _local.VOICE ?? null;
+export const NEUTRAL_PACK_SAY = NEUTRAL_SAY;
+export const MIMI_PACK_SAY = _local.say ?? {};
+
+// ---- scope split (personal pack = DM only) ----
+export const NEUTRAL_PACK = { PERSONA: NEUTRAL_PERSONA, say: NEUTRAL_SAY, VOICE: NEUTRAL_VOICE };
+export const MIMI_PACK = {
+  PERSONA: _local.PERSONA ?? null,
+  say: _local.say ?? {},
+  VOICE: _local.VOICE ?? null,
+};
+export const hasPersonalPack = () => !!(_local.VOICE || (_local.say && Object.keys(_local.say).length));
+
+let _getIsDual = () => false;
+let _getThreadType = () => ThreadType.Group;
+export function initPersonaScope({ getIsDual, getThreadType }) {
+  if (getIsDual) _getIsDual = getIsDual;
+  if (getThreadType) _getThreadType = getThreadType;
+}
+function _isDual() {
+  try {
+    return !!_getIsDual();
+  } catch {
+    return false;
+  }
+}
+function _threadType(id) {
+  try {
+    return _getThreadType(id);
+  } catch {
+    return ThreadType.Group;
+  }
+}
+// DM = dual account + User thread. Everything else (dual groups, all of
+// single mode, unknown threads) is neutral scope.
+export function isDMThread(id) {
+  return _isDual() && _threadType(id) === ThreadType.User;
+}
+export function sayFor(id) {
+  return isDMThread(id) ? { ...NEUTRAL_SAY, ...MIMI_PACK.say } : NEUTRAL_SAY;
+}
+export function voiceFor(id) {
+  return isDMThread(id) && MIMI_PACK.VOICE ? MIMI_PACK.VOICE : NEUTRAL_VOICE;
+}
 
 // Sticker keywords the AI may request via trailing [sticker:<kw>] tag.
 // Bounded set on purpose: resolver maps kw -> store sticker, unknown kws

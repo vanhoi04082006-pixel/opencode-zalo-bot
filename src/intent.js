@@ -42,6 +42,37 @@ const STOPWORDS = new Set([
   "yo",
 ]);
 
+// Emoji verdicts for pending confirmations (perm/qa/sensitive/shutdown/...).
+// Exact short match ONLY - never substring of long text (a decorative emoji
+// inside a sentence must not approve a destructive action).
+const EMOJI_YES = new Set(["👍", "✅", "👌", "🆗", "👏"]);
+const EMOJI_NO = new Set(["👎", "❌", "❎", "✖", "🙅", "🚫"]);
+function stripEmojiModifiers(s) {
+  return String(s ?? "").replace(/[\uFE0F\u200D\u2640\u2642\u{1F3FB}-\u{1F3FF}]/gu, "");
+}
+// Returns "yes" / "no" / null. Accepts a lone emoji or emoji + 1/3/y/n
+// ("👍", "👍 1", "1 👍"); anything longer or mixed is null (re-ask).
+export function detectEmojiVerdict(text) {
+  const e = stripEmojiModifiers(norm(text)).trim();
+  if (!e || [...e].length > 6) return null;
+  const tokens = e.split(/\s+/).filter(Boolean);
+  if (tokens.length > 2) return null;
+  const emo = tokens.filter((tk) => !/^[123yn]$/i.test(tk));
+  const rest = tokens.filter((tk) => /^[123yn]$/i.test(tk));
+  if (emo.length !== 1 || rest.length > 1) return null;
+  const mark = emo[0];
+  const extra = rest[0] ?? null;
+  if (EMOJI_YES.has(mark)) {
+    if (!extra || /^[1y]$/i.test(extra)) return "yes";
+    return null;
+  }
+  if (EMOJI_NO.has(mark)) {
+    if (!extra || /^[3n]$/i.test(extra)) return "no";
+    return null;
+  }
+  return null;
+}
+
 // Returns "yes" / "no" / null - only used while a confirmation is pending
 const YES = [
   "ok", "oke", "okie", "okay", "yes", "y", "yeah", "yep",
@@ -55,6 +86,8 @@ const NO = [
 export function detectYesNo(text) {
   const n = norm(text).trim();
   if (!n || n.length > 20) return null;
+  const ev = detectEmojiVerdict(text);
+  if (ev) return ev;
   const hit = (list) => list.some((w) => n === w || n.startsWith(w + " ") || n.endsWith(" " + w));
   if (hit(NO)) return "no";
   if (hit(YES)) return "yes";

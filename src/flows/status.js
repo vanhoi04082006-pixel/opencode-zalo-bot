@@ -10,7 +10,7 @@ import {
   vcsBranch,
   sessionFiles,
 } from "../opencode.js";
-import { say } from "./persona.js";
+import { sayFor } from "./persona.js";
 
 function fmtK(n) {
   const v = Math.max(0, Math.round(n ?? 0));
@@ -69,7 +69,7 @@ export async function buildStatusHeader(client, store, threadId, opts = {}) {
       : `${fmtK(usage.used)}`;
 
   const lines = [
-    say.statusHead(),
+    sayFor(threadId).statusHead(),
     `Project: ${dir}${branch ? `: ${branch}` : ""}`,
     `Model: ${modelLine}`,
     `Context: ${ctxLine}`,
