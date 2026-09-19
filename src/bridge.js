@@ -44,6 +44,7 @@ import { detectShutdownIntent, detectDirIntent } from "./intent.js";
 import { buildStatusHeader } from "./flows/status.js";
 import { CENTER_SYSTEM } from "./flows/system-prompt.js";
 import { parseStickerTag, sayFor, initPersonaScope } from "./flows/persona.js";
+import { initLogger, logger, logFilePath, getPackageVersion } from "./log.js";
 import { execFile, spawn } from "node:child_process";
 import { listTopDirs, buildIndex, searchFiles, norm } from "./filefind.js";
 import { parseSchedule, describeTask, fmtTime } from "./tasks.js";
@@ -86,7 +87,7 @@ import {
 let fileIndex = [];
 function refreshFileIndex() {
   buildIndex((info) => {
-    console.log(`[bridge] File index: ${info.count} files (${info.ms}ms) ${info.stopped ?? ""}`);
+    logger.info(`[bridge] File index: ${info.count} files (${info.ms}ms) ${info.stopped ?? ""}`);
   }).then(({ idx }) => {
     fileIndex = idx;
   });
@@ -357,9 +358,9 @@ async function ensureServe() {
     });
     child.unref();
     fs.writeFileSync(SERVE_PID_FILE, String(child.pid));
-    console.log(`[serve] da spawn PID ${child.pid}`);
+    logger.info(`[serve] da spawn PID ${child.pid}`);
   } catch (e) {
-    console.log("[serve] spawn loi:", e?.message ?? e);
+    logger.error(`[serve] spawn loi: ${e?.message ?? e}`);
     return false;
   }
   for (let i = 0; i < 15; i++) {
@@ -527,7 +528,7 @@ async function handleGroupText(threadId, text, msgId, uid, cliMsgId) {
     }
     // Dual: only the pending creator may approve (anti-hijack, same rule as tryConsumePending).
     if (isDual && p.by && uid && String(p.by) !== String(uid)) {
-      console.log(`[bridge] /ok denied (owner ${String(p.by).slice(-4)} vs ${String(uid).slice(-4)})`);
+      logger.warn(`[bridge] /ok denied (owner ${String(p.by).slice(-4)} vs ${String(uid).slice(-4)})`);
       return;
     }
     delete store.pending[threadId];
@@ -1510,12 +1511,12 @@ async function startWork(dmThreadId, dir, purpose) {
           if (requester && !members.some((m) => String(m).startsWith(String(requester)))) continue;
           groupId = id;
           reused = true;
-          console.log(`[bridge] Adopted existing group ${name} (${id}).`);
+          logger.info(`[bridge] Adopted existing group ${name} (${id}).`);
           break;
         }
       }
     } catch (e) {
-      console.log("[bridge] reconcile scan failed:", e?.message ?? e);
+      logger.error(`[bridge] reconcile scan failed: ${e?.message ?? e}`);
     }
   }
   if (!groupId) {
@@ -1617,7 +1618,7 @@ async function onSSE(ev) {
         break;
     }
   } catch (e) {
-    console.log("[sse] router loi:", e?.message ?? e);
+    logger.error(`[sse] router loi: ${e?.message ?? e}`);
   }
 }
 
@@ -1674,7 +1675,7 @@ async function bgNotify(sid, ev) {
       return;
     }
   } catch (e) {
-    console.log("[bridge] bgNotify loi:", e?.message ?? e);
+    logger.error(`[bridge] bgNotify loi: ${e?.message ?? e}`);
   }
 }
 async function resyncRuns() {
@@ -1731,12 +1732,12 @@ function ingestMessage(message) {
       // (loop risk), and without ownerIds anyone could drive the whole PC.
       // Strangers are dropped SILENTLY (no reply = no oracle, no spam loop).
       if (!ownUid) {
-        console.log("[bridge] Dual mode without ownUid - dropping message (loop risk).");
+        logger.warn("[bridge] Dual mode without ownUid - dropping message (loop risk).");
         return;
       }
       const sender = message?.data?.uidFrom;
       if (!isOwner(sender)) {
-        console.log(`[bridge] Non-owner message dropped (uid=${String(sender ?? "?").slice(-6)} thread=${String(threadId).slice(-6)}).`);
+        logger.warn(`[bridge] Non-owner message dropped (uid=${String(sender ?? "?").slice(-6)} thread=${String(threadId).slice(-6)}).`);
         // Mark seen so poll replays don't re-log the same stranger message.
         // (touchRecent/setThreadType stay below the gate: stranger threads
         // must never become notify/send targets.)
@@ -1788,17 +1789,17 @@ function ingestMessage(message) {
         }
         return; // own bridge message -> skip, loop guard
       }
-      console.log(`[bridge] New text message (${String(msgId).slice(-6)}): ${text.slice(0, 80)}`);
+      logger.info(`[bridge] New text message (${String(msgId).slice(-6)}): ${text.slice(0, 80)}`);
       trackSrcId(message?.data?.msgId, message?.data?.cliMsgId, threadId, text);
       chainGroup(threadId, () => handleGroupText(threadId, text, msgId, message?.data?.uidFrom, message?.data?.cliMsgId));
     } else if (content && typeof content === "object") {
       // Tin file/anh/video/voice: content la object kem href
-      console.log(`[bridge] New file message (${String(msgId).slice(-6)}): ${message?.data?.msgType ?? "?"}`);
+      logger.info(`[bridge] New file message (${String(msgId).slice(-6)}): ${message?.data?.msgType ?? "?"}`);
       trackSrcId(message?.data?.msgId, message?.data?.cliMsgId, threadId, `[${message?.data?.msgType ?? "file"}]`);
       chainGroup(threadId, () => handleAttachmentMessage(threadId, message));
     }
   } catch (e) {
-    console.error("[bridge] ingest:", e);
+    logger.error(`[bridge] ingest: ${e?.message ?? e}`);
   }
 }
 
@@ -1892,7 +1893,7 @@ async function handleAttachmentMessage(threadId, message) {
 }
 
 function onMessage(message) {
-  console.log(
+  logger.info(
     `[debug] live message: thread=${message?.threadId} type=${message?.type} contentType=${typeof message?.data?.content}`
   );
   ingestMessage(message);
@@ -1952,7 +1953,7 @@ async function onUndo(undo) {
       }
     }
   } catch (e) {
-    console.error("[bridge] undo:", e?.message ?? e);
+    logger.error(`[bridge] undo: ${e?.message ?? e}`);
   }
 }
 
@@ -1966,18 +1967,18 @@ function pollOnce() {
       } catch {}
     }
   } catch (e) {
-    console.log("[bridge] poll loi:", e?.message ?? e);
+    logger.warn(`[bridge] poll loi: ${e?.message ?? e}`);
   }
 }
 
 function onOldMessages(messages, type) {
-  console.log(`[debug] old_messages: count=${messages?.length ?? 0} type=${type}`);
+  logger.info(`[debug] old_messages: count=${messages?.length ?? 0} type=${type}`);
   try {
     if (type !== ThreadType.Group && type !== ThreadType.User) return;
     if (!isDual && type !== ThreadType.Group) return;
     for (const m of [...(messages ?? [])].reverse()) ingestMessage(m);
   } catch (e) {
-    console.error("[bridge] old_messages:", e);
+    logger.error(`[bridge] old_messages: ${e?.message ?? e}`);
   }
 }
 
@@ -1994,10 +1995,10 @@ function claimInstance() {
     if (pid && pid !== process.pid) {
       try {
         process.kill(pid, 0); // throws when not alive
-        console.log(`[bridge] Already running (PID ${pid}). Refusing second instance. Stop it first (scripts/restart-bridge.ps1) or delete bridge.pid if stale.`);
+        logger.error(`[bridge] Already running (PID ${pid}). Refusing second instance. Stop it first (bot.ps1 stop) or delete bridge.pid if stale.`);
         process.exit(2);
       } catch {
-        console.log(`[bridge] Stale bridge.pid (${pid}), reclaiming.`);
+        logger.warn(`[bridge] Stale bridge.pid (${pid}), reclaiming.`);
       }
     }
   } catch {
@@ -2006,7 +2007,7 @@ function claimInstance() {
   try {
     fs.writeFileSync(BRIDGE_PID_FILE, String(process.pid));
   } catch (e) {
-    console.log("[bridge] Cannot write bridge.pid:", e?.message ?? e);
+    logger.error(`[bridge] Cannot write bridge.pid: ${e?.message ?? e}`);
   }
   const release = () => {
     try {
@@ -2019,38 +2020,45 @@ function claimInstance() {
 }
 
 async function main() {
+  const ROOT = path.dirname(config.storePath);
+  const logFile = initLogger({ dir: path.join(ROOT, "logs"), prefix: "bridge" });
+  const version = getPackageVersion(ROOT);
   claimInstance();
+  logger.info(`Starting Zalo bridge v${version}...`);
+  logger.info(`Node.js ${process.version} on ${process.platform} ${process.arch}`);
+  logger.info(`Config loaded from ${path.join(ROOT, ".env")}`);
+  if (logFile) logger.info(`Logs are written to ${logFile}`);
   // Auto-detect: bot creds file (or ZALO_MODE=dual) = dedicated bot account
   // listening to all groups + DMs; otherwise legacy single shared account.
   isDual = isDualAccount();
   if (isDual && config.mode === "auto") {
-    console.log("[bridge] Dual-account mode (bot creds found). Listening to all groups + DMs.");
+    logger.info("[bridge] Dual-account mode (bot creds found). Listening to all groups + DMs.");
   } else if (isDual) {
-    console.log("[bridge] Dual-account mode (ZALO_MODE=dual). Listening to all groups + DMs.");
+    logger.info("[bridge] Dual-account mode (ZALO_MODE=dual). Listening to all groups + DMs.");
   } else {
-    console.log("[bridge] Single-account mode (shared acc).");
+    logger.info("[bridge] Single-account mode (shared acc).");
   }
   // Owner lock (dual): exactly these sender uids may drive the bot.
   // Empty in dual = refuse to start (fail-closed, loud) instead of
   // silently ignoring everyone.
   if (isDual) {
     if (!config.ownerIds.length) {
-      console.log("[bridge] FATAL: dual mode with empty ZALO_OWNER_IDS - refusing to start. Put your UID in .env.");
+      logger.error("[bridge] FATAL: dual mode with empty ZALO_OWNER_IDS - refusing to start. Put your UID in .env.");
       process.exit(1);
     }
-    console.log(`[bridge] Owner lock: ${config.ownerIds.join(",")}`);
+    logger.info(`[bridge] Owner lock: ${config.ownerIds.join(",")}`);
   }
   if (!isDual && !config.groupId) {
-    console.log("Missing ZALO_GROUP_ID in .env. Run: npm run find-group to get groupId, then put it in .env");
+    logger.error("Missing ZALO_GROUP_ID in .env. Run: npm run find-group to get groupId, then put it in .env");
     process.exit(1);
   }
   client = connectOpencode();
   const up = await waitForServer(client);
   if (!up) {
-    console.log(`Cannot reach ${config.opencodeUrl}. Open a terminal at E:\ and run: opencode serve --port 4096 --hostname 127.0.0.1`);
+    logger.error(`Cannot reach ${config.opencodeUrl}. Open a terminal at E:\\ and run: opencode serve --port 4096 --hostname 127.0.0.1`);
     process.exit(1);
   }
-  console.log("[opencode] serve connected");
+  logger.info("[OpenCodeReady] opencode serve is ready: reason=startup");
 
   // Clear leftovers stuck from a previous run (harmless if idle)
   // Single: the solo group session. Dual: every known thread session.
@@ -2064,25 +2072,30 @@ async function main() {
 
   // SSE from opencode: async results + permission + question
   stopSSE = subscribeEvents(client, onSSE, resyncRuns);
-  console.log("[sse] SSE listening on");
+  logger.info("[sse] SSE listening on");
 
   api = isDual ? await loginBot() : await loginZalo();
+  let botName = "";
   try {
     ownUid = api.getOwnId();
-    console.log("[zalo] ownUid ok");
+    logger.info("[zalo] ownUid ok");
+    try {
+      const me = await api.getUserInfo(ownUid);
+      botName = me?.changed_profiles?.[ownUid]?.displayName ?? me?.changed_profiles?.[ownUid]?.zaloName ?? "";
+    } catch {}
   } catch {
-    console.log("[zalo] cannot get ownUid (bubble delete will be skipped)");
+    logger.warn("[zalo] cannot get ownUid (bubble delete will be skipped)");
   }
   let reconnectTimer = null;
   const scheduleReconnect = (why) => {
     if (reconnectTimer) return;
-    console.log(`[zalo] connection lost (${why}), retrying in 5s...`);
+    logger.warn(`[zalo] connection lost (${why}), retrying in 5s...`);
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
       try {
         api.listener.start();
       } catch (e) {
-        console.log("[zalo] reconnect loi:", e?.message ?? e);
+        logger.error(`[zalo] reconnect loi: ${e?.message ?? e}`);
         scheduleReconnect("retry");
       }
     }, 5000);
@@ -2090,22 +2103,22 @@ async function main() {
   api.listener.on("message", onMessage);
   api.listener.on("old_messages", onOldMessages);
   api.listener.on("undo", onUndo);
-  api.listener.on("connected", () => console.log("[zalo] socket connected"));
+  api.listener.on("connected", () => logger.info("[zalo] socket connected"));
   api.listener.on("disconnected", (code, reason) => {
-    console.log("[zalo] socket disconnected", code, reason);
+    logger.warn(`[zalo] socket disconnected ${code} ${reason}`);
     scheduleReconnect(`disconnected ${code}`);
   });
   api.listener.on("closed", (code, reason) => {
-    console.log("[zalo] closed", code, reason);
+    logger.warn(`[zalo] closed ${code} ${reason}`);
     scheduleReconnect(`closed ${code}`);
   });
-  api.listener.on("error", (e) => console.log("[zalo] error", e?.message ?? e));
+  api.listener.on("error", (e) => logger.error(`[zalo] error ${e?.message ?? e}`));
   api.listener.start();
   if (isDual) {
     const scope = config.allowedThreads.length ? `whitelist: ${config.allowedThreads.join(",")}` : "all groups + DMs";
-    console.log(`[bridge] Listening as bot (${scope}). Mobile app only, DO NOT open chat.zalo.me`);
+    logger.info(`[bridge] Listening as bot (${scope}). Mobile app only, DO NOT open chat.zalo.me`);
   } else {
-    console.log(`[bridge] Listening on group ${config.groupId}. Mobile app only, DO NOT open chat.zalo.me`);
+    logger.info(`[bridge] Listening on group ${config.groupId}. Mobile app only, DO NOT open chat.zalo.me`);
   }
 
   // Ready ping: single -> solo group (AI: prefixed); dual -> configured
@@ -2115,23 +2128,25 @@ async function main() {
   const readyText = sayFor(readyTarget).ready(config.workdir);
   if (readyTarget) {
     await sendAI(readyTarget, readyText);
-    console.log("[bridge] ready message sent");
+    logger.info("[bridge] ready message sent");
+    logger.info(`Bot ${botName || "(unknown)"} started!`);
   } else {
-    console.log("[bridge] ready (dual, no target yet - will reply on first incoming thread)");
+    logger.info("[bridge] ready (dual, no target yet - will reply on first incoming thread)");
+    logger.info(`Bot ${botName || "(unknown)"} started!`);
   }
 
   await pollOnce();
   setInterval(pollOnce, 10000);
-  console.log("[bridge] polling every 10s");
+  logger.info("[bridge] polling every 10s");
 
   refreshFileIndex(); // build nen, khong chan
   setInterval(refreshFileIndex, 600000);
   startWatchdog(readyTarget); // tu start lai serve khi rot (null = resolve dong qua notifyTarget)
-  console.log("[serve] watchdog on (60s)");
+  logger.info("[serve] watchdog on (60s)");
   loadTasksOnBoot(); // reschedule timed tasks
 }
 
 main().catch((e) => {
-  console.error("[bridge] fatal:", e);
+  logger.error(`Failed to start bridge: ${e?.message ?? e}`);
   process.exit(1);
 });

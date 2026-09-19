@@ -29,8 +29,12 @@ npm run find-group
 npm run find-group:bot
 opencode serve --port 4096 --hostname 127.0.0.1
 npm run bridge       # lần đầu quét QR, các lần sau login bằng creds đã lưu
-# Restart sạch (khuyên dùng): kill chờ chết hẳn rồi mới start, tránh 2 bridge giẫm nhau
-npm run restart
+# Khuyên dùng bot.ps1 thay lệnh lẻ:
+#   .\bot.ps1 status   # trạng thái Bot/Serve + 5 dòng log cuối
+#   .\bot.ps1 restart  # restart sạch (chờ chết hẳn, chống 2 bridge giẫm nhau)
+#   .\bot.ps1 logs     # xem log trực tiếp
+#   bot-gui.ps1        # cửa sổ WinForms: đèn trạng thái + nút bấm + log live
+#   (không tham số = menu chọn)
 ```
 
 Lấy UID chủ: nhắn tin bất kỳ cho bot rồi xem log bridge (`uid=...`), hoặc `api.getOwnId()` ở acc chính.
@@ -107,6 +111,7 @@ Header `BotZalo` gồm: Project + branch (`vcs.get`, không phải git thì ẩn
 
 ```
 src/bridge.js              # điều phối: listener Zalo + routing /lệnh + SSE + main()
+src/log.js                 # logger tele-style [ISO] [LEVEL] ra console + logs/bridge-*.log (giữ 10 file)
 src/app/run-state.js       # runs/queues/chains/sentCli/srcIds/unsentIds/threadOwners
 src/zalo-login.js          # login cookie/QR (single + bot riêng)
 src/zalo/send.js           # gửi tin/file/bubble/typing + retry + thread-type
@@ -123,6 +128,8 @@ src/config.js / store.js   # cấu hình + persist atomic (sessions/tasks/thread
 scripts/screenshot.ps1     # chụp màn chính (BLANK khi màn khóa)
 scripts/click.ps1          # click chuột + trả cursor về chỗ cũ
 scripts/restart-bridge.ps1 # restart sạch (chờ chết hẳn)
+bot.ps1                    # quản lý console: status/menu/start/stop/restart/logs
+bot-gui.ps1                # panel WinForms: đèn trạng thái + nút + log live
 scripts/test-perm-queue.mjs# unit test (perm FIFO + tombstone + lifecycle + confirm-work)
 scripts/test-persona.mjs   # unit test persona (wrap/tag/resolver) + test-imports.mjs (chống crash import)
 ```
@@ -132,6 +139,7 @@ scripts/test-persona.mjs   # unit test persona (wrap/tag/resolver) + test-import
 - `Tham số không hợp lệ` khi gửi: sai thread-type (đa số do DM sau restart) — đã tự phục hồi qua `threadTypes` persist; còn gặp thì nhắn lại 1 tin để bridge học lại type.
 - `poll loi: WebSocket is not open (CONNECTING)`: poll đầu bắn sớm hơn socket nửa giây, vô hại nếu các poll sau chạy.
 - QR hết hạn: file QR tự tạo lại, quét mã mới nhất.
-- Bridge thứ 2 bị từ chối (`Already running`): dùng `npm run restart` thay vì chạy tay 2 cửa sổ.
+- Bridge thứ 2 bị từ chối (`Already running`): dùng `.\bot.ps1 restart` thay vì chạy tay 2 cửa sổ.
+- Boot xem gì: `Starting Zalo bridge v...` → mode + `Owner lock` → `Loaded store` → `[OpenCodeReady]` → `Bot <tên> started!` (xem `.\bot.ps1 logs`).
 - `/groups` trống sau restart: kiểm tra log boot (`Loaded store: ... projectGroups`) — báo ngay nếu thấy `FALLBACK .bak`.
 - `Non-owner message dropped` lặp lại: bình thường nếu acc lạ spam — mỗi tin chỉ log 1 lần; tin của owner vẫn qua.
