@@ -30,11 +30,12 @@ npm run find-group:bot
 opencode serve --port 4096 --hostname 127.0.0.1
 npm run bridge       # lần đầu quét QR, các lần sau login bằng creds đã lưu
 # Khuyên dùng bot.ps1 thay lệnh lẻ:
-#   .\bot.ps1 status   # trạng thái Bot/Serve + 5 dòng log cuối
-#   .\bot.ps1 restart  # restart sạch (chờ chết hẳn, chống 2 bridge giẫm nhau)
-#   .\bot.ps1 logs     # xem log trực tiếp
-#   bot-gui.ps1        # cửa sổ WinForms: đèn trạng thái + nút bấm + log live
-#   (không tham số = menu chọn)
+#   .\bot.ps1 status   # Bot/Serve/Port/Health + sessions/groups + 5 dòng log
+#   .\bot.ps1 start    # tự start serve (nếu thiếu) + bridge, chờ health, hiện status
+#   .\bot.ps1 restart  # stop cả serve + bridge rồi start lại
+#   .\bot.ps1 logs     # xem 30 dòng log mới nhất
+#   bot-gui.bat        # double-click mở panel WinForms (đèn + nút + log live)
+#   (không tham số = menu chọn; lưu ý stop/restart tắt cả serve :4096 chung)
 ```
 
 Lấy UID chủ: nhắn tin bất kỳ cho bot rồi xem log bridge (`uid=...`), hoặc `api.getOwnId()` ở acc chính.

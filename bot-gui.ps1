@@ -1,109 +1,172 @@
-# Zalo bridge WinForms panel (tele-style bot-gui.ps1).
-# Lights + buttons + live log. Closing this window does NOT stop bridge/serve.
+# Clickable control panel for zalo-opencode-bridge (Windows).
+#
+# Run via double-click on bot-gui.bat, or:
+#   powershell -STA -ExecutionPolicy Bypass -File .\bot-gui.ps1
+#
+# Closing this window does NOT stop the bridge or server.
+
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
-$ErrorActionPreference = "SilentlyContinue"
-$root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$pidFile = Join-Path $root "bridge.pid"
-$logFile = Join-Path $root "bridge-dual.log"
 
-function Get-BridgePid {
-  if (!(Test-Path $pidFile)) { return $null }
-  $p = [int](Get-Content $pidFile)
-  if (Get-Process -Id $p -ErrorAction SilentlyContinue) { return $p }
-  return $null
-}
-function Get-ServeHealth {
-  try {
-    $h = Invoke-RestMethod -Uri "http://127.0.0.1:4096/global/health" -TimeoutSec 4
-    if ($h.healthy) { return $true }
-  } catch {}
-  return $false
-}
+$ErrorActionPreference = "Stop"
+
+$projectRoot = $PSScriptRoot
+. (Join-Path $projectRoot "bot.ps1")
+
+$REFRESH_INTERVAL_MS = 5000
 
 $form = New-Object Windows.Forms.Form
 $form.Text = "Zalo Bridge"
 $form.Size = New-Object Drawing.Size(660, 540)
 $form.StartPosition = "CenterScreen"
+$form.FormBorderStyle = "FixedDialog"
+$form.MaximizeBox = $false
 
-$y = 12
-$lights = @{}
-foreach ($name in @("Bot", "Serve 4096", "Health")) {
-  $lb = New-Object Windows.Forms.Label
-  $lb.Text = $name
-  $lb.Location = New-Object Drawing.Point(12, $y)
-  $lb.Size = New-Object Drawing.Size(90, 23)
-  $form.Controls.Add($lb)
-  $lt = New-Object Windows.Forms.Label
-  $lt.Text = "..."
-  $lt.Location = New-Object Drawing.Point(110, $y)
-  $lt.Size = New-Object Drawing.Size(200, 23)
-  $form.Controls.Add($lt)
-  $lights[$name] = $lt
-  $y += 28
+function New-StatusLabel($x, $y, $name) {
+    $label = New-Object Windows.Forms.Label
+    $label.Location = New-Object Drawing.Point($x, $y)
+    $label.Size = New-Object Drawing.Size(600, 24)
+    $label.Font = New-Object Drawing.Font("Segoe UI", 11)
+    $label.Text = "$name : ..."
+    $form.Controls.Add($label)
+    return $label
 }
 
-$logBox = New-Object Windows.Forms.TextBox
-$logBox.Multiline = $true
-$logBox.ScrollBars = "Vertical"
-$logBox.ReadOnly = $true
-$logBox.Location = New-Object Drawing.Point(12, $y + 44)
-$logBox.Size = New-Object Drawing.Size(620, 300)
-$logBox.Font = New-Object Drawing.Font("Consolas", 9)
-$form.Controls.Add($logBox)
+$lblBot = New-StatusLabel 20 15 "Bridge"
+$lblServer = New-StatusLabel 20 45 "Server 4096"
+$lblHealth = New-StatusLabel 20 75 "Health"
 
-function Set-Light($label, $on, $text) {
-  $label.ForeColor = if ($on) { [Drawing.Color]::Green } else { [Drawing.Color]::Red }
-  $label.Text = $text
+function New-Button($x, $text) {
+    $button = New-Object Windows.Forms.Button
+    $button.Location = New-Object Drawing.Point($x, 110)
+    $button.Size = New-Object Drawing.Size(140, 36)
+    $button.Font = New-Object Drawing.Font("Segoe UI", 10)
+    $button.Text = $text
+    $form.Controls.Add($button)
+    return $button
 }
 
-function Refresh-All {
-  $pid = Get-BridgePid
-  $serve = Get-ServeHealth
-  if ($pid) { Set-Light $lights["Bot"] $true "BẬT (PID $pid)" } else { Set-Light $lights["Bot"] $false "TẮT" }
-  if ($serve) { Set-Light $lights["Serve 4096"] $true "BẬT" } else { Set-Light $lights["Serve 4096"] $false "TẮT" }
-  if ($pid -and $serve) { Set-Light $lights["Health"] $true "BẬT" } else { Set-Light $lights["Health"] $false "TẮT" }
-  if (Test-Path $logFile) {
-    $logBox.Text = (Get-Content $logFile | Select-Object -Last 30) -join "`r`n"
-  }
+$btnStart = New-Button 20 "Bật"
+$btnStop = New-Button 172 "Tắt"
+$btnRestart = New-Button 324 "Khởi động lại"
+$btnRefresh = New-Button 476 "Làm mới"
+
+$chkDebug = New-Object Windows.Forms.CheckBox
+$chkDebug.Location = New-Object Drawing.Point(20, 152)
+$chkDebug.Size = New-Object Drawing.Size(600, 24)
+$chkDebug.Font = New-Object Drawing.Font("Segoe UI", 9)
+$chkDebug.Text = "Hiện cửa sổ terminal (debug)"
+$chkDebug.Checked = $false
+$form.Controls.Add($chkDebug)
+
+$txtLog = New-Object Windows.Forms.TextBox
+$txtLog.Location = New-Object Drawing.Point(20, 180)
+$txtLog.Size = New-Object Drawing.Size(600, 258)
+$txtLog.Multiline = $true
+$txtLog.ReadOnly = $true
+$txtLog.ScrollBars = "Vertical"
+$txtLog.Font = New-Object Drawing.Font("Consolas", 9)
+$txtLog.Text = "Đang tải log..."
+$form.Controls.Add($txtLog)
+
+$lblHint = New-Object Windows.Forms.Label
+$lblHint.Location = New-Object Drawing.Point(20, 448)
+$lblHint.Size = New-Object Drawing.Size(600, 24)
+$lblHint.Font = New-Object Drawing.Font("Segoe UI", 9)
+$lblHint.ForeColor = [Drawing.Color]::Gray
+$lblHint.Text = "Đóng cửa sổ này không làm tắt bridge/server. Nút Tắt dừng cả serve :4096 chung."
+$form.Controls.Add($lblHint)
+
+function Set-Light($label, $name, $on, $detail) {
+    $state = "TẮT"
+    $color = [Drawing.Color]::Red
+    if ($on) {
+        $state = "BẬT"
+        $color = [Drawing.Color]::Green
+    }
+    $text = "$name : $state"
+    if ($detail) {
+        $text += " ($detail)"
+    }
+    $label.Text = $text
+    $label.ForeColor = $color
 }
 
-$bx = 12
-foreach ($pair in @(@("Bật", "start"), @("Tắt", "stop"), @("Khởi động lại", "restart"), @("Làm mới", "status"))) {
-  $btn = New-Object Windows.Forms.Button
-  $btn.Text = $pair[0]
-  $btn.Location = New-Object Drawing.Point($bx, 100)
-  $btn.Size = New-Object Drawing.Size(110, 30)
-  $tag = $pair[1]
-  $btn.Add_Click({
-    param($s, $e)
-    $a = $s.Tag
-    if ($a -eq "status") { Refresh-All; return }
-    Start-Process -FilePath "powershell" -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $root "bot.ps1"), $a -WindowStyle Hidden
-    Start-Sleep -Seconds 3
-    Refresh-All
-  }.GetNewClosure())
-  $btn.Tag = $tag
-  $form.Controls.Add($btn)
-  $bx += 120
+function Update-Status {
+    $bot = Get-BotProcess
+    $serve = Get-ServeProcess
+    $health = Get-ServeHealth
+
+    $botDetail = ""
+    if ($bot) {
+        $botDetail = "PID $($bot.ProcessId)"
+    }
+    Set-Light $lblBot "Bridge" ($null -ne $bot) $botDetail
+
+    $serveDetail = ""
+    if ($serve) {
+        $serveDetail = "PID $($serve.ProcessId)"
+    }
+    Set-Light $lblServer "Server 4096" ($null -ne $serve) $serveDetail
+    Set-Light $lblHealth "Health" ($null -ne $health) $health
+
+    $btnStart.Enabled = ($null -eq $bot)
+    $btnStop.Enabled = ($null -ne $bot) -or ($null -ne $serve)
+    $btnRestart.Enabled = $btnStop.Enabled
 }
 
-$chk = New-Object Windows.Forms.CheckBox
-$chk.Text = "Hiện cửa sổ terminal (debug)"
-$chk.Location = New-Object Drawing.Point(500, 105)
-$chk.Size = New-Object Drawing.Size(140, 24)
-$form.Controls.Add($chk)
+function Update-Log {
+    $log = Get-NewestLogFile
+    if ($null -eq $log) {
+        return
+    }
+    $text = (Get-Content -LiteralPath $log.FullName -Tail 30) -join "`r`n"
+    if ($txtLog.Text -ne $text) {
+        $txtLog.Text = $text
+        $txtLog.SelectionStart = $txtLog.Text.Length
+        $txtLog.ScrollToCaret()
+    }
+}
 
-$hint = New-Object Windows.Forms.Label
-$hint.Text = "Đóng cửa sổ này không làm tắt bot/serve."
-$hint.Location = New-Object Drawing.Point(12, 470)
-$hint.Size = New-Object Drawing.Size(620, 23)
-$form.Controls.Add($hint)
+function Set-Busy($busy, $message) {
+    $btnStart.Enabled = -not $busy
+    $btnStop.Enabled = -not $busy
+    $btnRestart.Enabled = -not $busy
+    $btnRefresh.Enabled = -not $busy
+    $chkDebug.Enabled = -not $busy
+    if ($busy) {
+        $form.Cursor = [Windows.Forms.Cursors]::WaitCursor
+        $txtLog.Text = $message
+    } else {
+        $form.Cursor = [Windows.Forms.Cursors]::Default
+    }
+    [Windows.Forms.Application]::DoEvents()
+}
+
+function Invoke-Safe($action) {
+    Set-Busy $true "Đang xử lý, chờ chút..."
+    try {
+        & $action
+    } catch {
+        [Windows.Forms.MessageBox]::Show($_.Exception.Message, "Lỗi", "OK", "Error") | Out-Null
+    }
+    Update-Status
+    Update-Log
+    Set-Busy $false ""
+    Update-Status
+}
+
+$btnStart.Add_Click({ Invoke-Safe { Start-All -ShowConsole:$chkDebug.Checked } })
+$btnStop.Add_Click({ Invoke-Safe { Stop-All } })
+$btnRestart.Add_Click({ Invoke-Safe { Stop-All; Start-Sleep -Seconds 2; Start-All -ShowConsole:$chkDebug.Checked } })
+$btnRefresh.Add_Click({ Update-Status; Update-Log })
 
 $timer = New-Object Windows.Forms.Timer
-$timer.Interval = 5000
-$timer.Add_Tick({ Refresh-All })
+$timer.Interval = $REFRESH_INTERVAL_MS
+$timer.Add_Tick({ Update-Status; Update-Log })
 $timer.Start()
 
-Refresh-All
+$form.Add_Shown({ Update-Status; Update-Log })
+$form.Add_FormClosed({ $timer.Stop() })
+
 [void]$form.ShowDialog()
