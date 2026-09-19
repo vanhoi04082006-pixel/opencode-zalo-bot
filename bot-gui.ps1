@@ -1,4 +1,4 @@
-# Clickable control panel for zalo-opencode-bridge (Windows).
+﻿# Clickable control panel for zalo-opencode-bridge (Windows).
 #
 # Run via double-click on bot-gui.bat, or:
 #   powershell -STA -ExecutionPolicy Bypass -File .\bot-gui.ps1

@@ -1,4 +1,4 @@
-# Start/stop/status control script for zalo-opencode-bridge (Windows).
+﻿# Start/stop/status control script for zalo-opencode-bridge (Windows).
 # Ported from opencode-telegram-bot/bot.ps1 - same structure, Zalo paths.
 #
 # Usage:
