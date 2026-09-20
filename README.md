@@ -38,6 +38,17 @@ npm run bridge       # lần đầu quét QR, các lần sau login bằng creds 
 #   (không tham số = menu chọn; lưu ý stop/restart tắt cả serve :4096 chung)
 ```
 
+## Tự chạy cùng Windows (serve + tele + zalo)
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-autostart.ps1
+```
+
+- Đăng ký Task Scheduler `ZaloBridgeAutostart`: chạy lúc logon + delay 60s chờ mạng, tự restart khi fail (5 phút/lần, 3 lần). Không cần admin. Chạy lại nhiều lần an toàn.
+- Mỗi lần logon chạy chuỗi `scripts/start-all.ps1`: serve trước (thiếu mới start) → chờ health 60s → tele bot → zalo bridge. Bỏ qua phần đang sống, không đẻ trùng. Log: `logs/start-all.log`.
+- Gỡ: `scripts/uninstall-autostart.ps1`. Reboot thật để kiểm chứng khi rảnh.
+- Giới hạn: Task Scheduler chỉ restart khi process *thoát*; treo cứng không phát hiện (vẫn còn watchdog riêng của từng bot).
+
 Lấy UID chủ: nhắn tin bất kỳ cho bot rồi xem log bridge (`uid=...`), hoặc `api.getOwnId()` ở acc chính.
 
 Xong khi group/DM hiện `bridge ready...`. Không mở `chat.zalo.me` bằng acc đang chạy bridge (đá listener).
