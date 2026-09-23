@@ -296,6 +296,17 @@ function Start-All {
 }
 
 function Show-Menu {
+    # Never block on Read-Host when there's no interactive console
+    # (hidden autostart/task runs) - show status instead of hanging.
+    try {
+        if ([Console]::IsInputRedirected -or -not [Environment]::UserInteractive) {
+            Show-Status
+            return
+        }
+    } catch {
+        Show-Status
+        return
+    }
     Write-Host ""
     Write-Host "Zalo Bridge" -ForegroundColor Cyan
     Write-Host "  1) start"

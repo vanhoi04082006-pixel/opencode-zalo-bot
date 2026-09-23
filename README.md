@@ -38,7 +38,9 @@ npm run bridge       # lần đầu quét QR, các lần sau login bằng creds 
 #   (không tham số = menu chọn; lưu ý stop/restart tắt cả serve :4096 chung)
 ```
 
-## Tự chạy cùng Windows (serve + tele + zalo)
+## Tự chạy cùng Windows (serve + tele + zalo, local-only)
+
+> Chuỗi autostart (`scripts/start-all.ps1`, `install/uninstall-autostart.ps1`) là **local-only, không có trong git** (đường dẫn + task theo máy). Mỗi máy tự tạo lại theo mẫu dưới.
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-autostart.ps1
