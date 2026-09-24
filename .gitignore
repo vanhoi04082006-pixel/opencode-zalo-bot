@@ -14,6 +14,7 @@ src/flows/persona.local.js
 scripts/start-all.ps1
 scripts/install-autostart.ps1
 scripts/uninstall-autostart.ps1
+scripts/run-hidden.vbs
 .env
 *.log
 .serve.pid

@@ -47,9 +47,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-autostart.ps
 ```
 
 - Đăng ký Task Scheduler `ZaloBridgeAutostart`: chạy lúc logon + delay 60s chờ mạng, tự restart khi fail (5 phút/lần, 3 lần). Không cần admin. Chạy lại nhiều lần an toàn.
-- Mỗi lần logon chạy chuỗi `scripts/start-all.ps1`: serve trước (thiếu mới start) → chờ health 60s → tele bot → zalo bridge. Bỏ qua phần đang sống, không đẻ trùng. Log: `logs/start-all.log`.
+- Mỗi lần logon chạy chuỗi `scripts/start-all.ps1` (hidden, không cửa sổ): serve trước (thiếu mới start) → chờ health 60s → tele bot → zalo bridge. Bỏ qua phần đang sống, không đẻ trùng. Log: `logs/start-all.log`.
 - Gỡ: `scripts/uninstall-autostart.ps1`. Reboot thật để kiểm chứng khi rảnh.
 - Giới hạn: Task Scheduler chỉ restart khi process *thoát*; treo cứng không phát hiện (vẫn còn watchdog riêng của từng bot).
+- Không dùng file `.vbs` trung gian (antivirus xóa file lạ + task chết câm). Nếu thấy cửa sổ đen của autostart thì **đừng tắt tay** (tắt = chain gãy) — muốn dừng thì `bot.ps1 stop`.
 
 Lấy UID chủ: nhắn tin bất kỳ cho bot rồi xem log bridge (`uid=...`), hoặc `api.getOwnId()` ở acc chính.
 
